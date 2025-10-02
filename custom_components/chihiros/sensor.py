@@ -23,8 +23,8 @@ if TYPE_CHECKING:
         BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC,
         establish_connection,
     )
-    from .chihiros_doser_control.protocol import UART_TX  # notify UUID
-    from .chihiros_doser_control import protocol as dp    # to build a query frame
+    from .chihiros_doser_control.main.protocol import UART_TX  # notify UUID
+    from .chihiros_doser_control.main import protocol as dp    # to build a query frame
 
 from .const import DOMAIN
 
@@ -106,8 +106,8 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC,
             establish_connection,
         )
-        from .chihiros_doser_control.protocol import UART_TX  # notify UUID
-        from .chihiros_doser_control import protocol as dp    # to build a query frame
+        from .chihiros_doser_control.main.protocol import UART_TX  # notify UUID
+        from .chihiros_doser_control.main import protocol as dp    # to build a query frame
 
         async with self._lock:
             if not self.address:

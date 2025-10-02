@@ -6,7 +6,7 @@ import asyncio
 import logging
 from abc import ABC, ABCMeta
 from datetime import datetime
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import typer
 from bleak.backends.device import BLEDevice
@@ -24,10 +24,10 @@ from bleak_retry_connector import (
 )
 from typing_extensions import Annotated
 
-from .. import commands
-from ..const import UART_RX_CHAR_UUID, UART_TX_CHAR_UUID
-from ..exception import CharacteristicMissingError
-from ..weekday_encoding import WeekdaySelect, encode_selected_weekdays
+from . import commands
+from .const import UART_RX_CHAR_UUID, UART_TX_CHAR_UUID
+from .exception import CharacteristicMissingError
+from ....helper.weekday_encoding import WeekdaySelect, encode_selected_weekdays
 
 DEFAULT_ATTEMPTS = 3
 
@@ -40,6 +40,20 @@ class _classproperty(property):
         ret: str = self.fget(owner_cls)  # type: ignore
         return ret
 
+ #  count of parameters.
+def _totSize(*args):
+    return sum(map(len, args))
+
+def _max_rgb_check(brightness, size_params):
+    if size_params == 3:
+       sum_rgb = brightness[0] + brightness[1] + brightness[2]
+    if size_params == 4:
+       sum_rgb = brightness[0] + brightness[1] + brightness[2] + brightness[3]   
+    if sum_rgb > 400 and size_params == 4:
+        raise ValueError("The values of RGB (red + green + blue + white) must not exceed 400% please correct")
+    if sum_rgb > 300 and size_params == 3:
+        raise ValueError("The values of RGB  must not exceed 300% please correct")
+    
 
 def _mk_ble_device(addr_or_ble: Union[BLEDevice, str]) -> BLEDevice:
     """Create a BLEDevice from a MAC string if needed."""
@@ -80,7 +94,7 @@ class BaseDevice(ABC):
         assert self._model_name is not None
 
     # Base methods
-
+     
     def set_log_level(self, level: int | str) -> None:
         """Set log level."""
         if isinstance(level, str):
@@ -143,11 +157,12 @@ class BaseDevice(ABC):
 
     async def set_color_brightness(
         self,
-        brightness: Annotated[int, typer.Argument(min=0, max=100)],
+        brightness: Annotated[int, typer.Argument(min=0, max=140)],
         color: str | int = 0,
     ) -> None:
         """Set brightness of a color."""
         color_id: int | None = None
+        print(self._colors.values())
         if isinstance(color, int) and color in self._colors.values():
             color_id = color
         elif isinstance(color, str) and color in self._colors:
@@ -161,17 +176,22 @@ class BaseDevice(ABC):
         await self._send_command(cmd, 3)
 
     async def set_brightness(
-        self, brightness: Annotated[int, typer.Argument(min=0, max=100)]
+                          
+        self, brightness: Annotated[List[int], typer.Argument(min=0, max=140, help="Parameter list, e.g. 0 0 0 or 0")],
     ) -> None:
         """Set light brightness."""
         await self.set_color_brightness(brightness)
 
     async def set_rgb_brightness(
-        self, brightness: Annotated[tuple[int, int, int], typer.Argument()]
+        self, 
+        brightness: Annotated[int, typer.Argument(min=0, max=140)],
     ) -> None:
         """Set RGB brightness."""
+        check_size = _totSize(brightness)
+        _max_rgb_check(brightness, check_size)
+        
         for c, b in enumerate(brightness):
-            await self.set_color_brightness(c, b)
+            await self.set_color_brightness(b, c)
 
     async def turn_on(self) -> None:
         """Turn on light."""

@@ -8,25 +8,25 @@ from typing import Type
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 
-from ..exception import DeviceNotFound
-from .base_device import BaseDevice
+from ..main.exception import DeviceNotFound
+from ..main.base_device import BaseDevice
 
 # Import all known model classes so they are present in this module's namespace
-from .a2 import AII
-from .c2 import CII
-from .c2rgb import CIIRGB
+from .LED.a2 import AII
+from .LED.c2 import CII
+from .RGB.c2rgb import CIIRGB
+from .fallback import Fallback
+from .TINY.tiny_terrarium_egg import TinyTerrariumEgg
+from .WRGB.wrgb2 import WRGBII
+from .WRGB.wrgb2_slim import WRGBIISlim
+from .TINY.z_light_tiny import ZLightTiny
 from .commander1 import Commander1
 from .commander4 import Commander4
-from .fallback import Fallback
-from .tiny_terrarium_egg import TinyTerrariumEgg
-from .universal_wrgb import UniversalWRGB
-from .wrgb2 import WRGBII
-from .wrgb2_pro import WRGBIIPro
-from .wrgb2_slim import WRGBIISlim
-from .z_light_tiny import ZLightTiny
+from .WRGB.wrgb2_pro import WRGBIIPro
+from .WRGB.universal_wrgb import UniversalWRGB
 
 # NEW: include the doser stub so discovery resolves to "Doser" instead of "fallback"
-from .doser import Doser  # make sure this file exists with _model_codes like ["DYDOSED2", "DYDOSED", "DYDOSE"]
+from ...chihiros_doser_control.device.doser import Doser  # make sure this file exists with _model_codes like ["DYDOSED2", "DYDOSED", "DYDOSE"]
 
 # Build a mapping of MODEL_CODE -> class by introspecting imported classes
 CODE2MODEL: dict[str, Type[BaseDevice]] = {}

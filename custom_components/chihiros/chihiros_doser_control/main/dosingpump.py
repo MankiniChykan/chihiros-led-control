@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import time
 from typing import Tuple, List
 
-from ..chihiros_led_control import commands
+from ...chihiros_led_control.main import commands
 from .protocol import _split_ml_25_6  # use the same 25.6+0.1 encoder
 
 def _clamp_byte(v: int) -> int:

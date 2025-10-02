@@ -26,7 +26,7 @@ except ModuleNotFoundError:
     callback = property  # type: ignore
 
 
-from .chihiros_led_control.device.base_device import BaseDevice
+from .chihiros_led_control.main.base_device import BaseDevice
 
 if TYPE_CHECKING:
     from bleak.backends.device import BLEDevice
