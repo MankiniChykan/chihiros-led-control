@@ -1,6 +1,6 @@
 """Universal WRGB device Model."""
 
-from .base_device import BaseDevice
+from ...main.base_device import BaseDevice
 
 
 class UniversalWRGB(BaseDevice):

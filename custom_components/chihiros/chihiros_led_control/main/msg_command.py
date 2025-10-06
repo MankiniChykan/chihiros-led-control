@@ -1,6 +1,10 @@
 """Module defining commands generation functions."""
 
+import asyncio
+import inspect
 import datetime
+from typing import Any, Optional, Union, List
+from bleak.backends.device import BLEDevice
 
 
 def next_message_id(current_msg_id: tuple[int, int] = (0, 0)) -> tuple[int, int]:
@@ -64,69 +68,49 @@ def create_set_time_command(msg_id: tuple[int, int]) -> bytearray:
         90, 9, msg_id, _encode_timestamp(datetime.datetime.now())
     )
 
+def _clamp_byte(v: int) -> int:
+    if not isinstance(v, int):
+        raise TypeError(f"Parameter must be int (got {type(v).__name__})")
+    if v < 0 or v > 255:
+        raise ValueError(f"Parameter byte out of range 0..255: {v}")
+    return v
 
-def create_manual_setting_command(
-    msg_id: tuple[int, int], color: int, brightness_level: int
-) -> bytearray:
-    """Set brightness.
-
-    param: color: 0-2 (0 is red, 1 is green, 2 is blue; on non-RGB models, 0 is white)
-    param: brightness_level: 0 - 100
-    """
-    return _create_command_encoding(90, 7, msg_id, [color, brightness_level])
-
-
-def create_add_auto_setting_command(
+def create_order_confirmation(
     msg_id: tuple[int, int],
-    sunrise: datetime.time,
-    sunset: datetime.time,
-    brightness: tuple[int, int, int],
-    ramp_up_minutes: int,
-    weekdays: int,
+    command_id: int,
+    mode: int,
+    command: int,
 ) -> bytearray:
-    """Add auto setting.
+    return _create_command_encoding(command_id, mode, msg_id, [_clamp_byte(command)])
 
-    brightness: tuple of 3 ints for red, green, and blue brightness, respectively
-                on non-RGB models, set to (white brightness, 255, 255)
-    weekdays: int resulting of selection bit mask
-              (Monday Tuesday Wednesday Thursday Friday Saturday Sunday) in decimal
-    """
-    parameters = [
-        sunrise.hour,
-        sunrise.minute,
-        sunset.hour,
-        sunset.minute,
-        ramp_up_minutes,
-        weekdays,
-        *brightness,
-        255,
-        255,
-        255,
-        255,
-        255,
-    ]
-
-    return _create_command_encoding(165, 25, msg_id, parameters)
-
-
-def create_delete_auto_setting_command(
+def _create_command_encoding(
+    cmd_id: int,
+    cmd_mode: int,
     msg_id: tuple[int, int],
-    sunrise: datetime.time,
-    sunset: datetime.time,
-    ramp_up_minutes: int,
-    weekdays: int,
+    parameters: list[int],
 ) -> bytearray:
-    """Create delete auto setting command."""
-    return create_add_auto_setting_command(
-        msg_id, sunrise, sunset, (255, 255, 255), ramp_up_minutes, weekdays
-    )
+    """
+    Wire format:
+      [cmd_id, 0x01, len(params)+5, msg_hi, msg_lo, cmd_mode, *params, checksum]
+    Checksum is XOR over bytes 1..end-1 (same as led-control `commands._calculate_checksum`).
+    If checksum == 0x5A, we bump the msg-id and retry (do NOT mutate payload bytes).
+    """
+    _clamp_byte(cmd_id); _clamp_byte(cmd_mode)
+    msg_hi, msg_lo = msg_id
+    _clamp_byte(msg_hi); _clamp_byte(msg_lo)
+    ps = [_clamp_byte(x) for x in parameters]
 
+    # try a few msg-ids until checksum != 0x5A
+    for _ in range(8):
+        frame = bytearray([cmd_id, 1, len(ps) + 5, msg_hi, msg_lo, cmd_mode] + ps)
+        checksum = _calculate_checksum(frame) & 0xFF
+        if checksum != 0x5A:
+            return frame + bytes([checksum])
+        msg_hi, msg_lo = _bump_msg_id(msg_hi, msg_lo)
 
-def create_reset_auto_settings_command(msg_id: tuple[int, int]) -> bytearray:
-    """Create reset auto setting command."""
-    return _create_command_encoding(90, 5, msg_id, [5, 255, 255])
+    # last resort: return the last attempt
+    return frame + bytes([checksum])
 
-
-def create_switch_to_auto_mode_command(msg_id: tuple[int, int]) -> bytearray:
+def create_switch_to_manuell_mode_command(msg_id: tuple[int, int]) -> bytearray:
     """Create switch auto setting command."""
-    return _create_command_encoding(90, 5, msg_id, [18, 255, 255])
+    return _create_command_encoding(90, 5, msg_id, [11, 255, 255])

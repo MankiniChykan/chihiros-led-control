@@ -1,0 +1,142 @@
+{
+   "STANDART": {
+      "ALL": {
+         "color": {
+            "blue": [
+               2,
+               100
+            ],
+            "green": [
+               1,
+               100
+            ],
+            "red": [
+               0,
+               100
+            ],
+            "white": [
+               3,
+               100
+            ]
+         },
+         "name_org": [
+            "ALL"
+         ]
+      },
+      "BUKELAND": {
+         "color": {
+            "blue": [
+               2,
+               108
+            ],
+            "green": [
+               1,
+               85
+            ],
+            "red": [
+               0,
+               122
+            ],
+            "white": [
+               3,
+               78
+            ]
+         },
+         "name_org": [
+            "Bukeland"
+         ]
+      },
+      "FRESHWATER": {
+         "color": {
+            "blue": [
+               2,
+               101
+            ],
+            "green": [
+               1,
+               110
+            ],
+            "red": [
+               0,
+               80
+            ],
+            "white": [
+               3,
+               100
+            ]
+         },
+         "name_org": [
+            "freshwater"
+         ]
+      },
+      "NATURE": {
+         "color": {
+            "blue": [
+               2,
+               120
+            ],
+            "green": [
+               1,
+               80
+            ],
+            "red": [
+               0,
+               108
+            ],
+            "white": [
+               3,
+               90
+            ]
+         },
+         "name_org": [
+            "nature"
+         ]
+      },
+      "RADIANT": {
+         "color": {
+            "blue": [
+               2,
+               108
+            ],
+            "green": [
+               1,
+               85
+            ],
+            "red": [
+               0,
+               122
+            ],
+            "white": [
+               3,
+               78
+            ]
+         },
+         "name_org": [
+            "radiant"
+         ]
+      },
+      "RGB": {
+         "color": {
+            "blue": [
+               2,
+               112
+            ],
+            "green": [
+               1,
+               109
+            ],
+            "red": [
+               0,
+               119
+            ],
+            "white": [
+               3,
+               0.14
+            ]
+         },
+         "name_org": [
+            "RGB"
+         ]
+      }
+   }
+}

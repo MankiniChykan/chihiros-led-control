@@ -41,4 +41,4 @@ include = [
 
 
 [project.scripts]
-chihirosctl = "custom_components.chihiros.chihiros_led_control.chihirosctl:app"
+chihirosctl = "custom_components.chihiros.chihiros_led_control.main.chihirosctl:app"

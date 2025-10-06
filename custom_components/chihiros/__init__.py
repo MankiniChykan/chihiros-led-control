@@ -41,7 +41,7 @@ async def async_setup_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> bool
     from .coordinator import ChihirosDataUpdateCoordinator
     from .models import ChihirosData
     # IMPORTANT: import doser services here (not at module import time)
-    from .chihiros_doser_control import register_services as register_doser_services
+    from .chihiros_doser_control.main import register_services as register_doser_services
 
     if entry.unique_id is None:
         raise ConfigEntryNotReady(f"Entry doesn't have any unique_id {entry.title}")

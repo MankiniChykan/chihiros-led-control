@@ -1,6 +1,6 @@
 """Commander 4 device Model."""
 
-from .base_device import BaseDevice
+from ..main.base_device import BaseDevice
 
 
 class Commander4(BaseDevice):

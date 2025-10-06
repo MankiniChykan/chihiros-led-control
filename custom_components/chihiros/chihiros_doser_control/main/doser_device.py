@@ -11,16 +11,17 @@ from bleak.backends.device import BLEDevice
 from bleak.exc import BleakDeviceNotFoundError, BleakError
 
 # 👈 go up to the common LED package (shared BaseDevice, time sync, weekday utils)
-from ...chihiros_led_control.device.base_device import BaseDevice
-from ...chihiros_led_control import commands as led_cmds
-from ...chihiros_led_control.weekday_encoding import (
+from ...chihiros_led_control.main.base_device import BaseDevice
+from ...chihiros_led_control.main import msg_command as msg_cmd
+from ...chihiros_led_control.main import ctl_command as ctl_cmd
+from ....helper.weekday_encoding import (
     WeekdaySelect,
     encode_selected_weekdays,
 )
 
 # 👇 these two live in the doser package root (one level up from /device)
-from .. import dosingpump
-from ..protocol import _split_ml_25_6
+from . import dosingpump
+from .protocol import _split_ml_25_6
 
 app = typer.Typer(help="Chihiros doser control")
 
@@ -79,8 +80,8 @@ class DoserDevice(BaseDevice):
         """
         prelude = [
             dosingpump.create_order_confirmation(self.get_next_msg_id(), 90, 4, 1),
-            led_cmds.create_set_time_command(self.get_next_msg_id()),
-            led_cmds.create_set_time_command(self.get_next_msg_id()),
+            ctl_cmd.create_set_time_command(self.get_next_msg_id()),
+            ctl_cmd.create_set_time_command(self.get_next_msg_id()),
             dosingpump.create_order_confirmation(self.get_next_msg_id(), 165, 4, 4),
             dosingpump.create_order_confirmation(self.get_next_msg_id(), 165, 4, 5),
             dosingpump.create_switch_to_auto_mode_dosing_pump_command(self.get_next_msg_id(), ch_id),
@@ -102,7 +103,7 @@ class DoserDevice(BaseDevice):
 
     async def enable_auto_mode_dosing_pump(self, ch_id: int) -> None:
         switch_cmd = dosingpump.create_switch_to_auto_mode_dosing_pump_command(self.get_next_msg_id(), ch_id)
-        time_cmd = led_cmds.create_set_time_command(self.get_next_msg_id())
+        time_cmd = ctl_cmd.create_set_time_command(self.get_next_msg_id())
         await self._send_command(switch_cmd, 3)
         await self._send_command(time_cmd, 3)
 
@@ -143,96 +144,6 @@ def _handle_connect_errors(ex: Exception) -> None:
     raise ex
 
 
-@app.command("set-dosing-pump-manuell-ml")
-def cli_set_dosing_pump_manuell_ml(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC, e.g. AA:BB:CC:DD:EE:FF")],
-    ch_id: Annotated[int, typer.Option("--ch-id", help="Channel 0..3", min=0, max=3)],
-    ch_ml: Annotated[float, typer.Option("--ch-ml", help="Dose (mL)", min=0.2, max=999.9)],
-):
-    """Immediate one-shot dose."""
-    async def run():
-        dd: DoserDevice | None = None
-        try:
-            ble = await _resolve_ble_or_fail(device_address)
-            dd = DoserDevice(ble)
-            await dd.set_dosing_pump_manuell_ml(ch_id, ch_ml)
-        except (BleakDeviceNotFoundError, BleakError, OSError) as ex:
-            _handle_connect_errors(ex)
-        finally:
-            if dd:
-                await dd.disconnect()
-    asyncio.run(run())
-
-
-@app.command("enable-auto-mode-dosing-pump")
-def cli_enable_auto_mode_dosing_pump(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC")],
-    ch_id: Annotated[int, typer.Option("--ch-id", help="Channel 0..3", min=0, max=3)] = 0,
-):
-    """Explicitly switch the doser channel to auto mode and sync time."""
-    async def run():
-        dd: DoserDevice | None = None
-        try:
-            ble = await _resolve_ble_or_fail(device_address)
-            dd = DoserDevice(ble)
-            await dd.enable_auto_mode_dosing_pump(ch_id)
-        except (BleakDeviceNotFoundError, BleakError, OSError) as ex:
-            _handle_connect_errors(ex)
-        finally:
-            if dd:
-                await dd.disconnect()
-    asyncio.run(run())
-
-
-@app.command("add-setting-dosing-pump")
-def cli_add_setting_dosing_pump(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC")],
-    performance_time: Annotated[datetime, typer.Argument(formats=["%H:%M"], help="HH:MM")],
-    ch_id: Annotated[int, typer.Option("--ch-id", help="Channel 0..3", min=0, max=3)],
-    ch_ml: Annotated[float, typer.Option("--ch-ml", help="Daily dose mL", min=0.2, max=999.9)],
-    weekdays: Annotated[List[WeekdaySelect], typer.Option(
-        "--weekdays", "-w", help="Repeat days; can be passed multiple times", case_sensitive=False
-    )] = [WeekdaySelect.everyday],
-):
-    """Add a 24h schedule entry at time with amount, on selected weekdays."""
-    async def run():
-        dd: DoserDevice | None = None
-        try:
-            ble = await _resolve_ble_or_fail(device_address)
-            dd = DoserDevice(ble)
-            mask = encode_selected_weekdays(weekdays)
-            tenths = int(round(ch_ml * 10))
-            await dd.add_setting_dosing_pump(performance_time.time(), ch_id, mask, tenths)
-        except (BleakDeviceNotFoundError, BleakError, OSError) as ex:
-            _handle_connect_errors(ex)
-        finally:
-            if dd:
-                await dd.disconnect()
-    asyncio.run(run())
-
-
-@app.command("raw-dosing-pump")
-def cli_raw_dosing_pump(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC")],
-    cmd_id: Annotated[int, typer.Option("--cmd-id", help="Command (e.g. 165)")],
-    mode: Annotated[int, typer.Option("--mode", help="Mode (e.g. 27)")],
-    # positional params come before any defaulted option to avoid Typer errors
-    params: Annotated[List[int], typer.Argument(help="Parameter list, e.g. 0 0 14 2 0 0")],
-    repeats: Annotated[int, typer.Option("--repeats", help="Send frame N times", min=1)] = 3,
-):
-    """Send a raw A5 frame: [cmd, 1, len, msg_hi, msg_lo, mode, *params, checksum]."""
-    async def run():
-        dd: DoserDevice | None = None
-        try:
-            ble = await _resolve_ble_or_fail(device_address)
-            dd = DoserDevice(ble)
-            await dd.raw_dosing_pump(cmd_id, mode, params, repeats)
-        except (BleakDeviceNotFoundError, BleakError, OSError) as ex:
-            _handle_connect_errors(ex)
-        finally:
-            if dd:
-                await dd.disconnect()
-    asyncio.run(run())
 
 
 if __name__ == "__main__":

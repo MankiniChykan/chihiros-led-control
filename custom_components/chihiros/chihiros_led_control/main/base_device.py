@@ -6,7 +6,7 @@ import asyncio
 import logging
 from abc import ABC, ABCMeta
 from datetime import datetime
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import typer
 from bleak.backends.device import BLEDevice
@@ -24,11 +24,12 @@ from bleak_retry_connector import (
 )
 from typing_extensions import Annotated
 
-from .. import commands
-from ..const import UART_RX_CHAR_UUID, UART_TX_CHAR_UUID
-from ..exception import CharacteristicMissingError
-from ..weekday_encoding import WeekdaySelect, encode_selected_weekdays
 
+from .const import UART_RX_CHAR_UUID, UART_TX_CHAR_UUID
+from .exception import CharacteristicMissingError
+from ....helper.weekday_encoding import WeekdaySelect, encode_selected_weekdays
+from ...chihiros_led_control.main import msg_command as msg_cmd
+from ...chihiros_led_control.main import ctl_command as ctl_cmd
 DEFAULT_ATTEMPTS = 3
 
 DISCONNECT_DELAY = 120
@@ -39,7 +40,6 @@ class _classproperty(property):
     def __get__(self, owner_self: object, owner_cls: ABCMeta) -> str:  # type: ignore
         ret: str = self.fget(owner_cls)  # type: ignore
         return ret
-
 
 def _mk_ble_device(addr_or_ble: Union[BLEDevice, str]) -> BLEDevice:
     """Create a BLEDevice from a MAC string if needed."""
@@ -57,7 +57,7 @@ class BaseDevice(ABC):
     _model_name: str | None = None
     _model_codes: list[str] = []
     _colors: dict[str, int] = {}
-    _msg_id = commands.next_message_id()
+    _msg_id = msg_cmd.next_message_id()
     _logger: logging.Logger
 
     def __init__(
@@ -65,6 +65,7 @@ class BaseDevice(ABC):
         ble_device: Union[BLEDevice, str],
         advertisement_data: AdvertisementData | None = None,
     ) -> None:
+        
         """Create a new device."""
         self._ble_device = _mk_ble_device(ble_device)
         self._logger = logging.getLogger(self._ble_device.address.replace(":", "-"))
@@ -80,7 +81,7 @@ class BaseDevice(ABC):
         assert self._model_name is not None
 
     # Base methods
-
+     
     def set_log_level(self, level: int | str) -> None:
         """Set log level."""
         if isinstance(level, str):
@@ -102,7 +103,7 @@ class BaseDevice(ABC):
 
     def get_next_msg_id(self) -> tuple[int, int]:
         """Get next message id."""
-        self._msg_id = commands.next_message_id(self._msg_id)
+        self._msg_id = msg_cmd.next_message_id(self._msg_id)
         return self._msg_id
 
     @_classproperty
@@ -143,7 +144,7 @@ class BaseDevice(ABC):
 
     async def set_color_brightness(
         self,
-        brightness: Annotated[int, typer.Argument(min=0, max=100)],
+        brightness: Annotated[int, typer.Argument(min=0, max=140)],
         color: str | int = 0,
     ) -> None:
         """Set brightness of a color."""
@@ -155,23 +156,28 @@ class BaseDevice(ABC):
         if color_id is None:
             self._logger.warning("Color not supported: `%s`", color)
             return
-        cmd = commands.create_manual_setting_command(
+        cmd = ctl_cmd.create_manual_setting_command(
             self.get_next_msg_id(), color_id, brightness
         )
         await self._send_command(cmd, 3)
 
     async def set_brightness(
-        self, brightness: Annotated[int, typer.Argument(min=0, max=100)]
+                          
+        self, brightness: Annotated[List[int], typer.Argument(min=0, max=140, help="Parameter list, e.g. 0 0 0 or 0")],
     ) -> None:
         """Set light brightness."""
         await self.set_color_brightness(brightness)
 
     async def set_rgb_brightness(
-        self, brightness: Annotated[tuple[int, int, int], typer.Argument()]
+        self, 
+        brightness: Annotated[int, typer.Argument(min=0, max=140)],
     ) -> None:
         """Set RGB brightness."""
+        check_size = ctl_cmd._totSize(brightness)
+        ctl_cmd._max_rgb_check(brightness, check_size)
+        
         for c, b in enumerate(brightness):
-            await self.set_color_brightness(c, b)
+            await self.set_color_brightness(b, c)
 
     async def turn_on(self) -> None:
         """Turn on light."""
@@ -194,7 +200,7 @@ class BaseDevice(ABC):
         ],
     ) -> None:
         """Add an automation setting to the light."""
-        cmd = commands.create_add_auto_setting_command(
+        cmd = ctl_cmd.create_add_auto_setting_command(
             self.get_next_msg_id(),
             sunrise.time(),
             sunset.time(),
@@ -219,7 +225,7 @@ class BaseDevice(ABC):
         ],
     ) -> None:
         """Add an automation setting to the RGB light."""
-        cmd = commands.create_add_auto_setting_command(
+        cmd = ctl_cmd.create_add_auto_setting_command(
             self.get_next_msg_id(),
             sunrise.time(),
             sunset.time(),
@@ -239,7 +245,7 @@ class BaseDevice(ABC):
         ],
     ) -> None:
         """Remove an automation setting from the light."""
-        cmd = commands.create_delete_auto_setting_command(
+        cmd = ctl_cmd.create_delete_auto_setting_command(
             self.get_next_msg_id(),
             sunrise.time(),
             sunset.time(),
@@ -250,13 +256,13 @@ class BaseDevice(ABC):
 
     async def reset_settings(self) -> None:
         """Remove all automation settings from the light."""
-        cmd = commands.create_reset_auto_settings_command(self.get_next_msg_id())
+        cmd = ctl_cmd.create_reset_auto_settings_command(self.get_next_msg_id())
         await self._send_command(cmd, 3)
 
     async def enable_auto_mode(self) -> None:
         """Enable auto mode of the light."""
-        switch_cmd = commands.create_switch_to_auto_mode_command(self.get_next_msg_id())
-        time_cmd = commands.create_set_time_command(self.get_next_msg_id())
+        switch_cmd = ctl_cmdcreate_switch_to_auto_mode_command(self.get_next_msg_id())
+        time_cmd = ctl_cmd.create_set_time_command(self.get_next_msg_id())
         await self._send_command(switch_cmd, 3)
         await self._send_command(time_cmd, 3)
 

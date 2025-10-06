@@ -1,6 +1,6 @@
 """WRGB II Slim device Model."""
 
-from .base_device import BaseDevice
+from ...main.base_device import BaseDevice
 
 
 class WRGBIISlim(BaseDevice):
