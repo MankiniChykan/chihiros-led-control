@@ -1,4 +1,4 @@
-# Re-export the public API so callers can do:
-#   from custom_components.chihiros.wireshark import iter_frames, parse_wireshark_json
-from .wireshark_core import *  # noqa: F401,F403
-__all__ = [name for name in dir() if not name.startswith("_")]
+# custom_components/chihiros/wireshark/__init__.py
+from __future__ import annotations
+from .wiresharkctl import app  # re-export Typer app for chihirosctl
+__all__ = ["app"]
