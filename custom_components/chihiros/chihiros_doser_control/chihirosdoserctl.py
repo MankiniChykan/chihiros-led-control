@@ -227,7 +227,7 @@ def bytes_decode_to_ctl(
         text = open(file_path, "r", encoding="utf-8").read()
     except OSError as e:
         raise typer.BadParameter(f"Could not read file: {e}") from e
-
+    print(text)
     recs = parse_log_blob(text)
     if not recs:
         typer.echo("No records parsed.")

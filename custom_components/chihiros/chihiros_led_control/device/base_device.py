@@ -136,6 +136,11 @@ class BaseDevice(ABC):
         self._ble_device = ble_device
         self._advertisement_data = advertisement_data
 
+# ────────────────────────────────────────────────────────────────
+# class BaseDevice
+# @property
+# ────────────────────────────────────────────────────────────────
+   
     @property
     def current_msg_id(self) -> tuple[int, int]:
         """Get current message id."""
@@ -145,17 +150,7 @@ class BaseDevice(ABC):
         """Get next message id."""
         self._msg_id = commands.next_message_id(self._msg_id)
         return self._msg_id
-
-    @_classproperty
-    def model_name(cls) -> str | None:  # type: ignore[override]
-        """Get the model of the device."""
-        return cls._model_name
-
-    @_classproperty
-    def model_codes(cls) -> list[str]:  # type: ignore[override]
-        """Return the model codes."""
-        return cls._model_codes
-
+    
     @property
     def colors(self) -> dict[str, int]:
         """Return the colors."""
@@ -180,9 +175,31 @@ class BaseDevice(ABC):
             return self._advertisement_data.rssi
         return None
 
-    # Command methods
+# ────────────────────────────────────────────────────────────────
+# class BaseDevice
+# @_classproperty
+# ────────────────────────────────────────────────────────────────
 
-    async def set_color_brightness(
+    @_classproperty
+    def model_name(cls) -> str | None:  # type: ignore[override]
+        """Get the model of the device."""
+        return cls._model_name
+
+    @_classproperty
+    def model_codes(cls) -> list[str]:  # type: ignore[override]
+        """Return the model codes."""
+        return cls._model_codes
+    
+    
+# ────────────────────────────────────────────────────────────────
+# Command methods intern
+# ────────────────────────────────────────────────────────────────
+
+# ────────────────────────────────────────────────────────────────
+# set_color_brightness to async_set_color_brightness  in class BaseDevice
+# ────────────────────────────────────────────────────────────────   
+
+    async def async_set_color_brightness(
         self,
         brightness: Annotated[int, typer.Argument(min=0, max=140)],
         color: str | int = 0,
@@ -201,13 +218,80 @@ class BaseDevice(ABC):
         )
         await self._send_command(cmd, 3)
 
-    async def set_brightness(
+# ────────────────────────────────────────────────────────────────
+# set_brightnes to async_set_brightnes in class BaseDevice
+# ────────────────────────────────────────────────────────────────   
+
+    async def async_set_brightness(
         self, brightness: Annotated[int, typer.Argument(min=0, max=140)]
     ) -> None:
         """Set overall brightness (maps to the default color channel)."""
-        await self.set_color_brightness(brightness=brightness, color=0)
+        await self.async_set_color_brightness(brightness=brightness, color=0)
 
-    async def set_rgb_brightness(
+# ────────────────────────────────────────────────────────────────
+# set_manual_mode to async_set_manual_mode in class BaseDevice
+# ────────────────────────────────────────────────────────────────   
+
+    async def async_set_manual_mode(self) -> None:
+        """Switch to manual mode by sending a manual mode command."""
+        for color_name in self._colors:
+            await self.async_set_color_brightness(100, color_name)
+ 
+
+
+
+# ────────────────────────────────────────────────────────────────
+# Command methods ctl
+# ────────────────────────────────────────────────────────────────
+
+# ────────────────────────────────────────────────────────────────
+# turn_on to get_turn_on in class BaseDevice
+# ────────────────────────────────────────────────────────────────   
+
+    async def get_turn_on(self) -> None:
+        """Turn on light."""
+        for color_name in self._colors:
+            await self.async_set_color_brightness(100, color_name)
+
+# ────────────────────────────────────────────────────────────────
+# turn_off to gget_turn_off in class BaseDevice
+# ────────────────────────────────────────────────────────────────
+
+    async def get_turn_off(self) -> None:
+        """Turn off light."""
+        for color_name in self._colors:
+            await self.async_set_color_brightness(0, color_name)
+
+# ────────────────────────────────────────────────────────────────
+# add_setting to get_add_setting in class BaseDevice
+# ────────────────────────────────────────────────────────────────
+
+    async def get_add_setting(
+        self,
+        sunrise: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
+        sunset: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
+        max_brightness: Annotated[int, typer.Option(max=100, min=0)] = 100,
+        ramp_up_in_minutes: Annotated[int, typer.Option(min=0, max=150)] = 0,
+        weekdays: Annotated[list[WeekdaySelect], typer.Option()] = [
+            WeekdaySelect.everyday
+        ],
+    ) -> None:
+        """Add an automation setting to the light."""
+        cmd = commands.create_add_auto_setting_command(
+            self.get_next_msg_id(),
+            sunrise.time(),
+            sunset.time(),
+            (max_brightness, 255, 255),
+            ramp_up_in_minutes,
+            encode_selected_weekdays(weekdays),
+        )
+        await self._send_command(cmd, 3)
+
+# ────────────────────────────────────────────────────────────────
+# rgb_brightness to get_rgb_brightness in class BaseDevice
+# ────────────────────────────────────────────────────────────────
+
+    async def get_rgb_brightness(
         self, brightness: Annotated[Sequence[int], typer.Argument()]
     ) -> None:
         """
@@ -237,40 +321,13 @@ class BaseDevice(ABC):
 
         # send values to channels in order (0=R,1=G,2=B,3=W)
         for chan_index, chan_value in enumerate(vals):
-            await self.set_color_brightness(brightness=chan_value, color=chan_index)
+            await self.async_set_color_brightness(brightness=chan_value, color=chan_index)
 
-    async def turn_on(self) -> None:
-        """Turn on light."""
-        for color_name in self._colors:
-            await self.set_color_brightness(100, color_name)
+# ────────────────────────────────────────────────────────────────
+# add_rgb_setting to get_add_rgb_setting in class BaseDevice
+# ────────────────────────────────────────────────────────────────
 
-    async def turn_off(self) -> None:
-        """Turn off light."""
-        for color_name in self._colors:
-            await self.set_color_brightness(0, color_name)
-
-    async def add_setting(
-        self,
-        sunrise: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
-        sunset: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
-        max_brightness: Annotated[int, typer.Option(max=100, min=0)] = 100,
-        ramp_up_in_minutes: Annotated[int, typer.Option(min=0, max=150)] = 0,
-        weekdays: Annotated[list[WeekdaySelect], typer.Option()] = [
-            WeekdaySelect.everyday
-        ],
-    ) -> None:
-        """Add an automation setting to the light."""
-        cmd = commands.create_add_auto_setting_command(
-            self.get_next_msg_id(),
-            sunrise.time(),
-            sunset.time(),
-            (max_brightness, 255, 255),
-            ramp_up_in_minutes,
-            encode_selected_weekdays(weekdays),
-        )
-        await self._send_command(cmd, 3)
-
-    async def add_rgb_setting(
+    async def get_add_rgb_setting(
         self,
         sunrise: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
         sunset: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
@@ -295,7 +352,11 @@ class BaseDevice(ABC):
         )
         await self._send_command(cmd, 3)
 
-    async def remove_setting(
+# ────────────────────────────────────────────────────────────────
+# remove_setting to get_remove_setting in class BaseDevice
+# ────────────────────────────────────────────────────────────────
+
+    async def get_remove_setting(
         self,
         sunrise: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
         sunset: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
@@ -314,24 +375,29 @@ class BaseDevice(ABC):
         )
         await self._send_command(cmd, 3)
 
-    async def reset_settings(self) -> None:
+# ────────────────────────────────────────────────────────────────
+# reset_settings to get_reset_settings in class BaseDevice
+# ────────────────────────────────────────────────────────────────
+
+    async def get_reset_settings(self) -> None:
         """Remove all automation settings from the light."""
         cmd = commands.create_reset_auto_settings_command(self.get_next_msg_id())
         await self._send_command(cmd, 3)
 
-    async def enable_auto_mode(self) -> None:
+# ────────────────────────────────────────────────────────────────
+# enable_auto_mode to get_enable_auto_mode in class BaseDevice
+# ────────────────────────────────────────────────────────────────
+
+    async def get_enable_auto_mode(self) -> None:
         """Enable auto mode of the light."""
         switch_cmd = commands.create_switch_to_auto_mode_command(self.get_next_msg_id())
         time_cmd = commands.create_set_time_command(self.get_next_msg_id())
         await self._send_command(switch_cmd, 3)
         await self._send_command(time_cmd, 3)
 
-    async def set_manual_mode(self) -> None:
-        """Switch to manual mode by sending a manual mode command."""
-        for color_name in self._colors:
-            await self.set_color_brightness(100, color_name)
-
-    # Bluetooth methods
+# ────────────────────────────────────────────────────────────────
+# # Bluetooth methods
+# ────────────────────────────────────────────────────────────────  
 
     async def _send_command(
         self, commands: list[bytes] | bytes | bytearray, retry: int | None = None

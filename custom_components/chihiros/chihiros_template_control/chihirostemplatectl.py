@@ -36,8 +36,8 @@ from ..chihiros_doser_control.device.doser_device import (  # noqa: F401
 def load_template_standart(
     device_address: str,
     template_name: Annotated[str, typer.Option()]):
-    brightness = sc.load_standart_template(device_address, template_name)
-    ctl.set_rgb_brightness(device_address, brightness=brightness)
+    brightness = sc.get_load_standart_template(device_address, template_name)
+    ctl.ctl_set_rgb_brightness(device_address, brightness=brightness)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -48,11 +48,11 @@ def load_template_standart(
 # ────────────────────────────────────────────────────────────────
 
 @app.command(name="set-template-standart")
-def set_template_standart(
+def ctl_set_template_standart(
     template_name: Annotated[str, typer.Option("--template-name")],
     brightness: Annotated[List[int], typer.Argument(min=0, max=140, help="Parameter list, e.g. 0 0 0 or 0")],
     ) -> None:
-       sc.set_template_standart(template_name, brightness)
+       sc.get_set_template_standart(template_name, brightness)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -63,12 +63,12 @@ def set_template_standart(
 # ────────────────────────────────────────────────────────────────
 
 @app.command(name="set-template")
-def set_template(
+def ctl_set_template(
     device_address: str,
     template_name: Annotated[str, typer.Option("--template-name")],
     brightness: Annotated[List[int], typer.Argument(min=0, max=140, help="Parameter list, e.g. 0 0 0 or 0")],
     ) -> None:
-       sc.set_template(device_address,template_name, brightness)
+       sc.get_set_template(device_address,template_name, brightness)
 
 # ────────────────────────────────────────────────────────────────
 # costum templates
@@ -78,12 +78,28 @@ def set_template(
 # ────────────────────────────────────────────────────────────────
 
 @app.command(name="load-template")
-def load_template(
+def ctl_load_template(
     device_address: str,
     template_name: Annotated[str, typer.Option()]):
-    brightness = sc.load_template(device_address, template_name)
-    ctl.set_rgb_brightness(device_address, brightness=brightness)
-    
+    brightness = sc.get_load_template(device_address, template_name)
+    ctl.ctl_set_rgb_brightness(device_address, brightness=brightness)
+
+# ────────────────────────────────────────────────────────────────
+# costum templates
+# chihirosctl template delete-template <device-address> --template-name example
+# ────────────────────────────────────────────────────────────────
+
+@app.command(name="delete-template")
+def ctl_delete_template(
+    device_address: str,
+    template_name: Annotated[str, typer.Option()]):
+    sc.get_delete_template(device_address, template_name)
+
+
+@app.command(name="show")
+def ctl_show_template(
+    device_address: str):
+    sc.get_show_template(device_address)
 
 if __name__ == "__main__":
     try:

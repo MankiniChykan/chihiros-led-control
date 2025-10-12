@@ -1,111 +1,70 @@
-#!/usr/bin/env python3
-"""
-Convert a Wireshark JSON export (array or NDJSON/"-T ek") into JSON Lines (1 JSON per line).
-
-✅ Windows-friendly:
-- Accepts relative paths like .\capture.json
-- Searches current dir, repo root, and tools\ if not found
-- Defaults output to custom_components\chihiros\wireshark\captures\<input_stem>.jsonl
-- Works with stdin/stdout ("-" argument)
-"""
-
+# tools/wireshark_core.py
 from __future__ import annotations
-import argparse, sys
-from pathlib import Path
-from custom_components.chihiros.wireshark.wireshark_core import parse_wireshark_stream, write_jsonl
 
+import json
+from typing import Dict, Any, Iterable, Iterator, TextIO
+from datetime import datetime
 
-def _repo_root() -> Path:
-    """Return repository root (tools/ is directly under it)."""
-    return Path(__file__).resolve().parent.parent
-
-
-def _captures_dir() -> Path:
-    """Return path to the captures folder."""
-    return _repo_root() / "custom_components/chihiros/wireshark/captures"
-
-
-def _resolve_input(p: str) -> Path:
+def _iter_input(stream: TextIO) -> Iterator[Dict[str, Any]]:
     """
-    Try CWD, absolute, repo root, and tools/ folder.
-    Returns a Path if found, else raises FileNotFoundError.
+    Accepts either a single JSON array or NDJSON (one JSON object per line).
+    Yields raw records (dicts).
     """
-    cand = Path(p).expanduser()
-    if cand.is_absolute() and cand.exists():
-        return cand
+    # Peek the first non-whitespace char
+    pos = stream.tell()
+    head = stream.read(1)
+    while head and head.isspace():
+        head = stream.read(1)
+    stream.seek(pos)
 
-    cwd_cand = (Path.cwd() / cand).resolve()
-    if cwd_cand.exists():
-        return cwd_cand
+    if head == "[":
+        data = json.load(stream)
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    yield item
+        return
 
-    root_cand = (_repo_root() / cand).resolve()
-    if root_cand.exists():
-        return root_cand
-
-    tools_cand = (_repo_root() / "tools" / cand.name).resolve()
-    if tools_cand.exists():
-        return tools_cand
-
-    raise FileNotFoundError(
-        f"Input not found: {p}\n"
-        f"  Tried: {cwd_cand}\n"
-        f"         {root_cand}\n"
-        f"         {tools_cand}"
-    )
+    for line in stream:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict):
+                yield obj
+        except Exception:
+            continue
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Convert a Wireshark JSON export (array or NDJSON) into JSON Lines (1 JSON per line)."
-    )
-    ap.add_argument("input", help="Wireshark export file (JSON array or NDJSON), or '-' for stdin")
-    ap.add_argument("--handle", default="0x0010", help="ATT handle to match (default 0x0010)")
-    ap.add_argument("--op", choices=["write", "notify", "any"], default="write", help="ATT op filter")
-    ap.add_argument("--rx", choices=["no", "also", "only"], default="no", help="Include notifications (RX)")
-    ap.add_argument(
-        "-o",
-        "--out",
-        help="Output JSONL path (default: captures/<input_stem>.jsonl, or '-' for stdout)",
-    )
-    ap.add_argument("--pretty", action="store_true", help="Pretty-print each JSON line")
-    args = ap.parse_args()
+def _layers_of(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Wireshark JSON puts decoded fields under _source.layers and frequently
+    wraps values in single-item lists. Normalize that to plain dict/scalars.
+    """
+    src = rec.get("_source", rec)
+    layers = src.get("layers", src.get("_source.layers")) or {}
+    if not isinstance(layers, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for k, v in layers.items():
+        out[k] = v[0] if isinstance(v, list) and len(v) == 1 else v
+    return out
 
-    # Resolve input stream
-    if args.input == "-":
-        in_path = None
-        in_stream = sys.stdin
-    else:
-        in_path = _resolve_input(args.input)
-        in_stream = in_path.open("r", encoding="utf-8")
 
-    # Resolve output stream (default → captures/<input_stem>.jsonl)
-    if args.out in (None, "") and in_path is not None:
-        out_path = _captures_dir() / f"{in_path.stem}.jsonl"
-    elif args.out == "-":
-        out_path = None
-    else:
-        outp = Path(args.out).expanduser()
-        out_path = (Path.cwd() / outp).resolve() if not outp.is_absolute() else outp
+def _get(d: Dict[str, Any], *path: str, default=None):
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    return cur
 
-    # Open output
-    if out_path is None:
-        out_stream = sys.stdout
-    else:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_stream = out_path.open("w", encoding="utf-8")
 
+def _norm_handle(h: str | None) -> str:
+    if not h:
+        return ""
     try:
-        rows = parse_wireshark_stream(in_stream, handle=args.handle, op=args.op, rx=args.rx)
-        write_jsonl(rows, out_stream, pretty=args.pretty)
-        if out_path:
-            print(f"✅ Output written to: {out_path}", file=sys.stderr)
-        return 0
-    finally:
-        if in_stream is not sys.stdin:
-            in_stream.close()
-        if out_stream is not sys.stdout:
-            out_stream.close()
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        return f"0x{int(str(h), 16):x}"
+    except Exception:
+        return str(h).lower()

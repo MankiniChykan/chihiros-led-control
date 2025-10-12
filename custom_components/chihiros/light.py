@@ -114,11 +114,11 @@ class ChihirosLightEntity(
             brightness = int((kwargs[ATTR_BRIGHTNESS] / 255) * 100)
             _LOGGER.debug("Turning on: %s to %s", self.name, brightness)
             # TODO: handle error and availability False
-            await self._device.set_color_brightness(brightness, self._color)
+            await self._device.async_set_color_brightness(brightness, self._color)
             self._attr_brightness = kwargs[ATTR_BRIGHTNESS]
         else:
             _LOGGER.debug("Turning on: %s", self.name)
-            await self._device.set_color_brightness(100, self._color)
+            await self._device.async_set_color_brightness(100, self._color)
         self._attr_is_on = True
         self._attr_available = True
         self.schedule_update_ha_state()
@@ -128,7 +128,7 @@ class ChihirosLightEntity(
         """Instruct the light to turn off."""
         _LOGGER.debug("Turning off: %s", self.name)
         # TODO handle error and availability False
-        await self._device.set_color_brightness(0, self._color)
+        await self._device.async_set_color_brightness(0, self._color)
         self._attr_is_on = False
         self._attr_brightness = 0
         self._attr_available = True

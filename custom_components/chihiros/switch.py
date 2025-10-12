@@ -64,7 +64,7 @@ class ChihirosAutoManualSwitch(SwitchEntity):
 
     async def async_turn_off(self, **kwargs):
         """Manual mode: set brightness to last known or default value."""
-        await self._device.set_manual_mode()
+        await self._device.async_set_manual_mode()
         self._attr_is_on = False
         self.async_write_ha_state()
         _LOGGER.debug("Switched to manual mode for %s", self._device.name)
