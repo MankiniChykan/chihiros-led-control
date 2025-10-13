@@ -17,7 +17,6 @@ __all__ = [
     "decode_weekdays", "ml_from_25_6",
     "parse_frame", "parse_log_blob", "decode_records",
     "DeviceState", "ChannelState", "TimerState", "build_device_state", "to_ctl_lines",
-    # optional helper (for nicer debug on params-only logs)
     "interpret_param_burst",
 ]
 
@@ -31,9 +30,9 @@ UART_TX      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # notify
 # ────────────────────────────────────────────────────────────────
 # Command families
 # ────────────────────────────────────────────────────────────────
-CMD_MANUAL_DOSE  = 0xA5  # 165  (A5-style, "doser")
+CMD_MANUAL_DOSE  = 0xA5  # 165, "doser"
 MODE_MANUAL_DOSE = 0x1B  # 27
-CMD_LED_QUERY    = 0x5B  # 91   (5B-style, "LED" frames used for totals)
+CMD_LED_QUERY    = 0x5B  # 91, “LED”/report side, includes totals
 
 # ────────────────────────────────────────────────────────────────
 # Message-ID generator (avoid 0x5A in either byte)
@@ -56,6 +55,8 @@ def _next_msg_id() -> Tuple[int, int]:
 # Checksums / param sanitization
 # ────────────────────────────────────────────────────────────────
 def _xor_checksum(buf: bytes) -> int:
+    if len(buf) < 2:
+        return 0
     c = buf[1]
     for b in buf[2:]:
         c ^= b
@@ -106,7 +107,7 @@ def encode_5b(mode: int, params: List[int]) -> bytes:
     return body + bytes([chk])
 
 # ────────────────────────────────────────────────────────────────
-# mL encoding (25.6-bucket + 0.1 remainder) — used by manual dose
+# mL encoding (25.6 bucket + 0.1 remainder) — used by manual dose
 # ────────────────────────────────────────────────────────────────
 def _split_ml_25_6(total_ml: Union[float, int, str]) -> tuple[int, int]:
     """
@@ -132,6 +133,9 @@ def _split_ml_25_6(total_ml: Union[float, int, str]) -> tuple[int, int]:
         lo  = 0
     return hi & 0xFF, lo & 0xFF
 
+def ml_from_25_6(hi_buckets: int, tenths_remainder: int) -> float:
+    return round(25.6 * hi_buckets + 0.1 * tenths_remainder, 1)
+
 # ────────────────────────────────────────────────────────────────
 # Public write: immediate one-shot dose (manual)
 # ────────────────────────────────────────────────────────────────
@@ -149,32 +153,24 @@ async def dose_ml(client, channel_1based: int, ml: Union[float, int, str]) -> No
     await client.write_gatt_char(UART_RX, pkt, response=True)
 
 # ────────────────────────────────────────────────────────────────
-# Totals helpers (LED-style 0x5B, plus A5 fallbacks)
+# Totals helpers (LED-style 0x5B only)
 # ────────────────────────────────────────────────────────────────
-def build_totals_query_5b(mode_5b: int = 0x22) -> bytes:
-    """Prefer 0x5B totals query; default mode 0x22 (some fw use 0x1E)."""
+def build_totals_query_5b(mode_5b: int = 0x34) -> bytes:
+    """Prefer 0x5B daily totals query; default mode 0x34 (some fw use 0x22)."""
     return encode_5b(mode_5b, [])
 
 def build_totals_query() -> bytes:
-    """Back-compat single-frame helper; try 0x5B/0x22, else A5/0x22."""
-    try:
-        return encode_5b(0x22, [])
-    except Exception:
-        return _encode(CMD_MANUAL_DOSE, 0x22, [])
+    """Back-compat single-frame helper; still LED-first (0x34)."""
+    return build_totals_query_5b(0x34)
 
 def build_totals_probes() -> list[bytes]:
-    """Return a small set of viable totals queries across firmwares."""
+    """
+    Return a small set of viable totals queries across firmwares.
+    STRICTLY LED (0x5B) now: try 0x34 first, then 0x22.
+    """
     frames: list[bytes] = []
-    try:
-        frames.append(encode_5b(0x22, []))
-        frames.append(encode_5b(0x1E, []))
-    except Exception:
-        pass
-    try:
-        frames.append(_encode(CMD_MANUAL_DOSE, 0x22, []))
-        frames.append(_encode(CMD_MANUAL_DOSE, 0x1E, []))
-    except Exception:
-        pass
+    frames.append(encode_5b(0x34, []))  # daily totals (preferred)
+    frames.append(encode_5b(0x22, []))  # alt fw
     # de-dup preserving order
     seen, uniq = set(), []
     for f in frames:
@@ -185,56 +181,66 @@ def build_totals_probes() -> list[bytes]:
     return uniq
 
 # ────────────────────────────────────────────────────────────────
-# Robust totals parsing (0x5B)
+# Daily totals parsing (STRICT 0x5B / 91 with 16-bit ml×100 pairs)
 # ────────────────────────────────────────────────────────────────
-def _looks_like_totals_pairs(p: List[int]) -> bool:
-    """
-    Heuristic: p must be length 8 and represent four (hi, lo) pairs where
-    hi is small (0..10 is plenty for most realistic daily totals with 25.6 mL buckets)
-    and lo fits in a byte (0..255).
-    """
-    if len(p) != 8:
-        return False
-    for i in range(0, 8, 2):
-        hi = p[i]
-        lo = p[i + 1]
-        if not (0 <= hi <= 10 and 0 <= lo <= 255):
-            return False
-    return True
-
-def _decode_totals_pairs(pairs8: List[int]) -> List[float]:
-    # hi*25.6 + lo*0.1 for 4 channels
-    return [round(pairs8[i] * 25.6 + pairs8[i + 1] / 10.0, 1) for i in range(0, 8, 2)]
+def _decode_u16_be(hi: int, lo: int) -> int:
+    return ((hi & 0xFF) << 8) | (lo & 0xFF)
 
 def parse_totals_frame(payload: bytes | bytearray) -> Optional[List[float]]:
     """
-    If 'payload' is 0x5B-style, decode 4 channel totals:
-      [ch1_hi, ch1_lo, ch2_hi, ch2_lo, ch3_hi, ch3_lo, ch4_hi, ch4_lo]
-      ml = hi*25.6 + lo*0.1
+    Parse 0x5B daily totals (Mode 0x34, some fw 0x22).
+    Packet layout (observed):
+       [ 0x5B, 0x01, len, msg_hi, msg_lo, mode,  hdr0, ch_count,  (ch1_hi, ch1_lo, ch2_hi, ch2_lo, ch3_hi, ch3_lo, ch4_hi, ch4_lo),  checksum ]
+    Where each (hi, lo) is a **big-endian 16-bit value** equal to ml×100.
 
-    Supports both the strict 8-param form and longer packets that embed the 8
-    bytes somewhere in the params (common on some firmwares).
+    Returns a list of four floats [ch1, ch2, ch3, ch4] in mL.
+    If fewer than 4 channels are reported, missing entries are filled with 0.0.
     """
-    if not isinstance(payload, (bytes, bytearray)) or len(payload) < 15:
+    if not isinstance(payload, (bytes, bytearray)) or len(payload) < 16:
         return None
     if payload[0] != CMD_LED_QUERY:
         return None
 
-    # params live after 'mode' byte up to (but excluding) checksum
+    # MODE should be 0x34 or 0x22; we won't strictly enforce here but keep it in mind
     params = list(payload[6:-1])
+    if len(params) < 2 + 2:  # need at least header + one pair
+        return None
 
-    # Fast path: exactly 8 → decode directly
-    if len(params) == 8 and _looks_like_totals_pairs(params):
-        return _decode_totals_pairs(params)
+    # Many dumps show a small 2-byte header before the pairs: [hdr0, ch_count]
+    # We’ll accept both “with header” and “pairs only” variants.
+    ch_count = None
+    start_idx = 0
 
-    # Robust path: scan any contiguous window of length 8 that looks like totals
-    if len(params) >= 8:
-        for i in range(0, len(params) - 8 + 1):
-            win = params[i:i + 8]
-            if _looks_like_totals_pairs(win):
-                return _decode_totals_pairs(win)
+    if len(params) >= 10:
+        # try header interpretation if it fits: params[1] looks like count 1..4
+        maybe_count = params[1]
+        if 1 <= maybe_count <= 4 and (len(params) - 2) >= maybe_count * 2:
+            ch_count = maybe_count
+            start_idx = 2
 
-    return None
+    # If no header, try to infer count by length (favor 4)
+    if ch_count is None:
+        # prefer 4 channels if we have ≥8 bytes
+        if len(params) >= 8:
+            ch_count = 4
+            start_idx = 0
+        else:
+            return None
+
+    values: List[float] = []
+    pairs_bytes = params[start_idx:start_idx + ch_count * 2 * 1_000_000]  # big upper bound slice
+    # Take exactly 4 channels worth if available; pad to 4 with zeros
+    for i in range(0, min(len(pairs_bytes), 8), 2):
+        hi = pairs_bytes[i]
+        lo = pairs_bytes[i + 1] if i + 1 < len(pairs_bytes) else 0
+        centi = _decode_u16_be(hi, lo)  # ml * 100
+        values.append(round(centi / 100.0, 2))  # keep 0.01 mL resolution
+
+    # Pad to 4 channels
+    while len(values) < 4:
+        values.append(0.0)
+
+    return values[:4]
 
 # ────────────────────────────────────────────────────────────────
 # Weekday helpers
@@ -254,11 +260,8 @@ def decode_weekdays(mask: int) -> List[str]:
         return ["everyday"]
     return [name for bit, name in WEEKDAY_BITS.items() if mask & bit]
 
-def ml_from_25_6(hi_buckets: int, tenths_remainder: int) -> float:
-    return round(25.6 * hi_buckets + 0.1 * tenths_remainder, 1)
-
 # ────────────────────────────────────────────────────────────────
-# Frame decoders (tolerant)
+# Frame decoders (tolerant) for A5/165 traffic (schedules, timers, manual dose)
 # ────────────────────────────────────────────────────────────────
 def _dose27_is_manual(params: List[int]) -> bool:
     """
@@ -295,8 +298,15 @@ def decode_time_90_9(params: List[int]) -> Dict[str, Any]:
     }
 
 def decode_activate_165_32(params: List[int]) -> Dict[str, Any]:
-    ch, _zero, enable = params
-    return {"type": "activate", "channel": ch, "enabled": bool(enable)}
+    # Some firmwares: [ch, enable_flag, confirm_flag] → treat “enable_flag” as enabled
+    if len(params) == 3:
+        ch, en, _confirm = params
+        return {"type": "activate", "channel": ch, "enabled": bool(en)}
+    # Fallback 3 fields variant [ch, 0, enable]
+    if len(params) >= 3:
+        ch, _z, en = params[:3]
+        return {"type": "activate", "channel": ch, "enabled": bool(en)}
+    return {"type": "activate", "channel": params[0] if params else 0, "enabled": None}
 
 def decode_dose_165_27(params: List[int]) -> Dict[str, Any]:
     # Manual-dose variants first
@@ -328,20 +338,17 @@ def decode_dose_165_27(params: List[int]) -> Dict[str, Any]:
             "raw_aux": [],
         }
 
-    # Fallback: original 6-field 25.6+0.1 layout from captures
+    # Fallback: original 6-field 25.6+0.1 layout from older captures
     if len(params) == 6:
         ch, mask, c1, c2, hi, tenths = params
-        ml = ml_from_25_6(hi, tenths)
         obj = {
             "type": "dose_entry",
             "channel": ch,
             "weekdays_mask": mask,
             "weekdays": decode_weekdays(mask),
-            "amount_ml": ml,
+            "amount_ml": ml_from_25_6(hi, tenths),
             "raw_aux": [c1, c2],
         }
-        if not (0.2 <= ml <= 99999.0):
-            obj["warning"] = "dose_out_of_range"
         return obj
 
     return {"type": "unknown_27", "params": params}
@@ -356,14 +363,12 @@ def decode_timer_165_21(params: List[int]) -> Dict[str, Any]:
         "start_hour": hh,
         "start_minute": mm,
     }
-    if not (0 <= mm <= 59):
-        entry["warning"] = "minute_out_of_range"
     return entry
 
 def parse_frame(cmd_id: int, mode: int, params: List[int]) -> Dict[str, Any]:
     if cmd_id == 90 and mode == 9 and len(params) == 6:
         return decode_time_90_9(params)
-    if cmd_id == 165 and mode == 32 and len(params) == 3:
+    if cmd_id == 165 and mode == 32 and len(params) >= 3:
         return decode_activate_165_32(params)
     if cmd_id == 165 and mode == 27 and (len(params) in (5, 6)):
         return decode_dose_165_27(params)
@@ -440,7 +445,7 @@ def decode_records(records: Iterable[Tuple[int,int,List[int]]]) -> List[Dict[str
 # ────────────────────────────────────────────────────────────────
 @dataclass
 class TimerState:
-    timer_type: Optional[int] = None   # 1 == 24-hour on some fw
+    timer_type: Optional[int] = None
     start_hour: Optional[int] = None
     start_minute: Optional[int] = None
 
@@ -460,7 +465,6 @@ class ChannelState:
         if t == "activate":
             self.enabled = bool(event.get("enabled"))
         elif t == "dose_entry":
-            # weekly variant can carry time and enable
             self.amount_ml = float(event.get("amount_ml"))
             if "weekdays_mask" in event:
                 self.weekdays_mask = int(event.get("weekdays_mask"))
@@ -472,7 +476,6 @@ class ChannelState:
             if "enabled" in event and self.enabled is None:
                 self.enabled = bool(event.get("enabled"))
         elif t == "manual_dose":
-            # keep last manual dose amount (debugging/telemetry)
             self.amount_ml = float(event.get("amount_ml"))
         elif t == "timer":
             self.timer.timer_type = int(event.get("timer_type"))
@@ -497,7 +500,7 @@ def build_device_state(parsed_rows: List[Dict[str, Any]]) -> DeviceState:
     for ev in parsed_rows:
         et = ev.get("type")
         if et == "time_set":
-            ds.device_time = ev  # keep last seen
+            ds.device_time = ev
             continue
         if et in {"activate", "dose_entry", "manual_dose", "timer"}:
             ch = int(ev["channel"])
@@ -517,7 +520,6 @@ def _weekday_str(mask: Optional[int]) -> str:
     names = decode_weekdays(int(mask))
     if names == ["everyday"]:
         return "Every day"
-    # preserve Mon..Sun ordering for readability
     order = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
     names_sorted = [n for n in order if n in names]
     short = {"monday":"Mon","tuesday":"Tue","wednesday":"Wed","thursday":"Thu",
@@ -534,7 +536,7 @@ def to_ctl_lines(state: DeviceState) -> List[str]:
         )
     for ch_idx in sorted(state.channels.keys()):
         st = state.channels[ch_idx]
-        chn = ch_idx  # wire is 0..3; caller can map to CH1..CH4 if needed
+        chn = ch_idx  # wire 0..3; caller can map to CH1..CH4
         if st.enabled is not None:
             lines.append(f"ch{chn}.enabled={'1' if st.enabled else '0'}")
         if st.amount_ml is not None:
@@ -542,7 +544,6 @@ def to_ctl_lines(state: DeviceState) -> List[str]:
         if st.weekdays_mask is not None:
             lines.append(f"ch{chn}.weekday_mask={int(st.weekdays_mask)}")
             lines.append(f"ch{chn}.weekdays={_weekday_str(st.weekdays_mask)}")
-        # prefer explicit weekly time if known; else timer start
         hh = st.time_hour if st.time_hour is not None else st.timer.start_hour
         mm = st.time_minute if st.time_minute is not None else st.timer.start_minute
         if hh is not None and mm is not None:
@@ -586,14 +587,15 @@ def interpret_param_burst(params: List[int]) -> Dict[str, Any]:
             out["details"].update({"channel": params[0], "amount_ml": ml_from_25_6(hi, lo)})
             return out
 
-    # Try totals window if someone logged only the params section of a 0x5B frame
-    if n >= 8:
-        for i in range(0, n - 8 + 1):
-            win = params[i:i + 8]
-            if _looks_like_totals_pairs(win):
-                out["guess"] = "maybe_led_totals_0x5B"
-                out["details"]["totals_ml"] = _decode_totals_pairs(win)
-                return out
+    # Totals pairs (ml×100) sometimes logged as params only: 8 bytes = 4 × (hi, lo)
+    if n >= 8 and n % 2 == 0:
+        pairs = []
+        for i in range(0, min(n, 8), 2):
+            pairs.append(((params[i] << 8) | params[i+1]) / 100.0)
+        if len(pairs) >= 4:
+            out["guess"] = "maybe_led_totals_0x5B_16bit"
+            out["details"]["totals_ml"] = [round(x, 2) for x in pairs[:4]]
+            return out
 
     return out
 
@@ -601,17 +603,14 @@ def interpret_param_burst(params: List[int]) -> Dict[str, Any]:
 # Quick self-test / example
 # ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Demo with your Channel 3 capture (24-hour set, 37.0 mL, minute 42, everyday)
+    # Example A5 programming stream (schedules/timers/manual dose)
     example_frames = [
         (90, 4,  [1]),
         (90, 9,  [25, 10, 2, 11, 28, 47]),
-        (90, 9,  [25, 10, 2, 11, 28, 47]),
-        (CMD_MANUAL_DOSE, 4,  [4]),
-        (CMD_MANUAL_DOSE, 4,  [5]),
-        (CMD_MANUAL_DOSE, 32, [2, 0, 1]),
-        (CMD_MANUAL_DOSE, 27, [2, 127, 1, 1, 1, 114]),  # legacy weekly variant
-        (CMD_MANUAL_DOSE, 21, [2, 1, 0, 42, 0, 0]),     # 24h start 00:42
-        (CMD_MANUAL_DOSE, 27, [1, 0, 0, 1, 140]),       # manual dose 25.6*1 + 14.0 = 39.6 mL (5-byte form)
+        (CMD_MANUAL_DOSE, 32, [2, 1, 1]),                    # enable CH2
+        (CMD_MANUAL_DOSE, 27, [2, 127, 1, 0, 27, 75]),       # weekly CH2 00:27, 7.5 mL
+        (CMD_MANUAL_DOSE, 21, [2, 1, 0, 27, 0, 0]),          # timer CH2 00:27
+        (CMD_MANUAL_DOSE, 27, [1, 0, 0, 1, 140]),            # manual dose ~39.6 mL (5-byte form)
     ]
     parsed = decode_records(example_frames)
     state = build_device_state(parsed)
@@ -622,3 +621,7 @@ if __name__ == "__main__":
     print("\nCTL:")
     for ln in to_ctl_lines(state):
         print(ln)
+
+    # Example totals (0x5B, mode 0x34): header [0,4] + 4 pairs (ml×100), e.g. 0.30, 1.20, 13.50, 16.30
+    demo = bytes([0x5B, 0x01, 0x0A, 0x00, 0x01, 0x34, 0x00, 0x04, 0x00, 0x30, 0x01, 0x20, 0x13, 0x50, 0x16, 0x30, 0x00])
+    print("\nTotals parse demo:", parse_totals_frame(demo))

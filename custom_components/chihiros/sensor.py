@@ -1,3 +1,4 @@
+# custom_components/chihiros/sensor.py
 from __future__ import annotations
 
 import asyncio
@@ -13,10 +14,10 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, CoordinatorEntity
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-# --- Kill-switch: keep file details but stop functionality entirely ---
-DISABLE_DOSER_TOTAL_SENSORS: bool = True
+# Enable totals sensors
+DISABLE_DOSER_TOTAL_SENSORS: bool = False
 
-# Keep type hints without importing heavy deps at runtime when disabled
+# Keep type hints without importing heavy deps at module import time
 if TYPE_CHECKING:
     from bleak_retry_connector import (
         BleakClientWithServiceCache,
@@ -24,23 +25,23 @@ if TYPE_CHECKING:
         establish_connection,
     )
     from .chihiros_doser_control.protocol import UART_TX  # notify UUID
-    from .chihiros_doser_control import protocol as dp    # to build a query frame
+    from .chihiros_doser_control import protocol as dp    # helpers
 
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_TIMEOUT = 8.0            # seconds to wait for one notify (slightly longer)
+SCAN_TIMEOUT = 8.0            # seconds to wait for one totals notify
 UPDATE_EVERY = timedelta(minutes=15)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    """Platform entry point — intentionally inert when disabled."""
+    """Set up doser daily total sensors per config entry."""
     if DISABLE_DOSER_TOTAL_SENSORS:
-        _LOGGER.info("chihiros.sensor: totals sensors are DISABLED; skipping setup for %s", entry.entry_id)
+        _LOGGER.info("chihiros.sensor: totals sensors DISABLED; skipping setup for %s", entry.entry_id)
         return
 
-    # --- Original setup code preserved below (will not run while disabled) ---
+    # Get BLE address from your integration's stored coordinator (unchanged)
     data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     address: Optional[str] = getattr(getattr(data, "coordinator", None), "address", None)
     _LOGGER.debug("chihiros.sensor: setup entry=%s addr=%s", entry.entry_id, address)
@@ -50,7 +51,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     # Non-blocking initial refresh
     hass.async_create_task(coordinator.async_request_refresh())
 
-    # Thread-safe dispatcher: refresh immediately after "Dose Now" (per-entry)
+    # Per-entry refresh signal (e.g., after “Dose Now” service)
     signal = f"{DOMAIN}_{entry.entry_id}_refresh_totals"
 
     def _signal_refresh_entry() -> None:
@@ -59,7 +60,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     unsub = async_dispatcher_connect(hass, signal, _signal_refresh_entry)
     entry.async_on_unload(unsub)
 
-    # NEW: also listen for per-address refresh requests
+    # Also allow per-address refresh signal
     if address:
         sig_addr = f"{DOMAIN}_refresh_totals_{address.lower()}"
 
@@ -69,7 +70,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         unsub2 = async_dispatcher_connect(hass, sig_addr, _signal_refresh_addr)
         entry.async_on_unload(unsub2)
 
-    # NEW: push path — when the dose service emits decoded totals, adopt them
+    # Push path — if your services decode totals and dispatch them, adopt directly
     if address:
         push_sig = f"{DOMAIN}_push_totals_{address.lower()}"
 
@@ -85,7 +86,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
 
 class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Listen briefly for the 0x5B totals notify and decode hi/lo pairs (modes vary)."""
+    """Listen briefly for the 0x91 totals notify and decode centi-mL pairs."""
 
     def __init__(self, hass: HomeAssistant, address: Optional[str], entry: ConfigEntry):
         super().__init__(hass, logger=_LOGGER, name=f"{DOMAIN}-doser-totals", update_interval=UPDATE_EVERY)
@@ -95,19 +96,19 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._lock = asyncio.Lock()  # avoid overlapping BLE connects
 
     async def _async_update_data(self) -> dict[str, Any]:
-        # Stay inert even if somehow called while disabled
+        # Guard (shouldn’t be hit because setup exits when disabled)
         if DISABLE_DOSER_TOTAL_SENSORS:
             _LOGGER.debug("sensor: coordinator update skipped (disabled)")
             return self._last
 
-        # Lazy-import runtime-only deps so the module can live without them when disabled
+        # Lazy-import runtime-only deps so the module can be imported without them
         from bleak_retry_connector import (
             BleakClientWithServiceCache,
             BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC,
             establish_connection,
         )
         from .chihiros_doser_control.protocol import UART_TX  # notify UUID
-        from .chihiros_doser_control import protocol as dp    # to build a query frame
+        from .chihiros_doser_control import protocol as dp    # to build query/probes & parse
 
         async with self._lock:
             if not self.address:
@@ -123,26 +124,16 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
 
             def _cb(_char, payload: bytearray):
+                """Notify callback — STRICT 0x91 totals only."""
                 try:
-                    if len(payload) < 8:
+                    if not payload:
                         return
-
-                    # NEW: use tolerant decoder if available; else fallback logic
                     values: Optional[list[float]] = None
-                    if hasattr(dp, "parse_totals_frame"):
-                        try:
-                            values = dp.parse_totals_frame(payload)  # tolerant (any 0x5B mode, 8 params)
-                        except Exception:
-                            values = None
-
-                    if values is None:
-                        # Fallback: accept cmd=0x5B and at least 8 params after mode; use first 8
-                        cmd = payload[0]
-                        params = list(payload[6:-1]) if len(payload) >= 8 else []
-                        if cmd in (0x5B, 91) and len(params) >= 8:
-                            p8 = params[:8]
-                            pairs = list(zip(p8[0::2], p8[1::2]))
-                            values = [round(h * 25.6 + l / 10.0, 1) for h, l in pairs]
+                    try:
+                        # Expect 0x91 cmd with mode 0x34 (or 0x22), four 16-bit BE pairs
+                        values = dp.parse_totals_frame(payload)
+                    except Exception:
+                        values = None
 
                     if values is not None and not fut.done():
                         fut.set_result({"ml": values, "raw": bytes(payload)})
@@ -158,30 +149,21 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 await client.start_notify(UART_TX, _cb)
 
-                # NEW: actively try a small set of probe frames to trigger totals push
+                # Try a small set of probes to nudge devices if they need a request
                 frames: list[bytes] = []
                 try:
-                    # Prefer helper from protocol.py if present
                     if hasattr(dp, "build_totals_probes"):
                         frames = list(dp.build_totals_probes())
                 except Exception:
                     frames = []
 
+                # Optional: if you want LED-only probes, make build_totals_probes LED-only in protocol.py
                 if not frames:
-                    # Fallback set: 5B/0x22, 5B/0x1E, A5/0x22, A5/0x1E
                     try:
                         frames.extend([dp.encode_5b(0x22, []), dp.encode_5b(0x1E, [])])
                     except Exception:
                         pass
-                    try:
-                        frames.extend([
-                            dp._encode(dp.CMD_MANUAL_DOSE, 0x22, []),
-                            dp._encode(dp.CMD_MANUAL_DOSE, 0x1E, []),
-                        ])
-                    except Exception:
-                        pass
 
-                # Send probes (lightly spaced) then wait for a notify
                 for idx, frame in enumerate(frames):
                     try:
                         await client.write_gatt_char(dp.UART_RX, frame, response=True)
