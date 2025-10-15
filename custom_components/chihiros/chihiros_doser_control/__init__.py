@@ -477,17 +477,29 @@ else:
                 msg_hi, msg_lo = 0, 1
                 wire_ch = max(1, min(channel, 4)) - 1
                 frame_auto = create_switch_to_auto_mode_dosing_pump_command((msg_hi, msg_lo), wire_ch, 0, 1)
-                await dp.send_and_await_ack(
-                    client,
-                    bytes(frame_auto),
-                    expect_cmd=dp.CMD_MANUAL_DOSE,
-                    expect_ack_mode=0x07,
-                    ack_timeout_ms=400,
-                    heartbeat_min_ms=300,
-                    heartbeat_max_ms=900,
-                    retries=1,
-                )
-                _LOGGER.info("enable_auto_mode: ACK received")
+                _LOGGER.info("enable_auto_mode: sending auto-mode frame %s", frame_auto.hex(" ").upper())
+
+                # Try direct write to RX, fallback to TX
+                try:
+                    await client.write_gatt_char(dp.UART_RX, frame_auto, response=True)
+                    _LOGGER.debug("enable_auto_mode: wrote to RX")
+                except Exception:
+                    await client.write_gatt_char(dp.UART_TX, frame_auto, response=True)
+                    _LOGGER.debug("enable_auto_mode: RX failed, wrote to TX instead")
+
+                # Start a short notify window to log whatever comes back
+                def _cb(_char, payload: bytearray):
+                    raw = bytes(payload)
+                    head = f"{raw[0]:02X}" if raw else "??"
+                    mode = f"{raw[5]:02X}" if len(raw) > 6 else "??"
+                    _LOGGER.debug("enable_auto_mode: notify head=%s mode=%s raw=%s", head, mode, raw.hex(" ").upper())
+
+                await client.start_notify(UART_TX, _cb)
+                _LOGGER.info("enable_auto_mode: listening 3s for ACK/notify…")
+                await asyncio.sleep(3.0)
+                await client.stop_notify(UART_TX)
+                _LOGGER.info("enable_auto_mode: finished 3s listen window (no blocking ACK wait)")
+
 
                 elapsed = (time.perf_counter() - started) * 1000
                 await _notify(
