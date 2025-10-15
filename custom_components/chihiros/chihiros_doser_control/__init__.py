@@ -1,3 +1,62 @@
+# custom_components/chihiros/chihiros_doser_control/__init__.py
+"""
+Chihiros Doser — Home Assistant service surface (runtime-only).
+
+OVERVIEW
+--------
+This module is the *runtime* glue between Home Assistant and the doser protocol
+helpers that live in `custom_components/chihiros/chihiros_doser_control/`.
+It registers a handful of services (listed below) and implements the BLE I/O
+loops needed to talk to the device using HA’s Bluetooth stack plus
+`bleak_retry_connector` (which plays nicely with HA’s BLE queue/slots).
+
+Why this file exists separately from the CLI:
+- The CLI (`chihirosctl`) needs to import parts of the doser package without
+  importing Home Assistant. To keep that import safe, all HA imports happen
+  *inside* the `try:` block; if HA isn’t present we export a tiny stub for
+  `register_services` which simply raises at call time (but import still works).
+- Inside HA, `async_setup_entry` (in the integration `__init__.py`) calls this
+  module’s `register_services(hass)` exactly once per HA run. The function
+  is idempotent and will no-op on reloads.
+
+SERVICES (must match services.yaml)
+-----------------------------------
+Provided (and enabled):
+• `dose_ml`               — Perform a one-shot manual dose on a channel.
+• `enable_auto_mode`     — Put a channel into “auto” mode and sync device time.
+• `read_auto_settings`   — Passive listener for auto schedule frames (pretty printed).
+• `read_container_status`— Passive listener for container/tank notifications (raw hex).
+• `raw_doser_command`    — Advanced: send arbitrary A5/0x5B frames.
+
+Kept for reference but disabled behind flags (see FEATURE FLAGS):
+• `read_daily_totals`    — Active read of 0x5B “daily totals” (sensors already do this).
+• `set_24h_dose`         — Program 24-hour dosing; left in code for later.
+
+HOW THE “PUSH PATH” WORKS
+-------------------------
+After `dose_ml` completes, we immediately try a couple of LED-side “totals probe”
+frames (0x1E and 0x22 in 0x5B and A5 shapes). If the device replies with a
+0x5B “daily totals” frame, we decode it and *dispatch* it via HA’s dispatcher:
+    async_dispatcher_send(hass, f"{DOMAIN}_push_totals_{addr_l}", {"ml": [...], "raw": bytes})
+The daily-dose sensors subscribe to that signal (per-address) and update without
+needing to poll immediately. They also do periodic passive refreshes on their own.
+
+NOTES / PITFALLS
+----------------
+- BLE address is looked up via device_id (device registry) or can be provided
+  directly via the service call. Addresses are normalized to uppercase for HA.
+- We use HA’s `establish_connection` wrapper to benefit from retry and slot
+  handling. We also guard notification + write with try/except to tolerate
+  firmwares that expect writes on TX rather than RX.
+- If you add new services, make sure to:
+    1) define a voluptuous schema here,
+    2) register it in `register_services`,
+    3) add the matching entry in `services.yaml`.
+
+This file is designed to be copied as-is into your integration. No project-wide
+imports are performed at module import time other than cheap constants/types.
+"""
+
 from __future__ import annotations
 
 # Explicit public API so this module is import-safe for CLI/tests regardless of HA.
@@ -27,7 +86,7 @@ try:
     )
 
     from ..const import DOMAIN  # integration domain
-    from . import protocol as dp  # provides dose_ml(client, channel, ml)
+    from . import protocol as dp  # protocol helpers (dose_ml, parse_totals_frame, etc.)
     from .protocol import UART_TX  # notify UUID for totals frames
 
     # human-friendly weekday handling using your existing encoding helper
@@ -62,7 +121,7 @@ else:
     _LOGGER = logging.getLogger(__name__)
 
     # ────────────────────────────────────────────────────────────
-    # Feature flags (disable problematic services)
+    # FEATURE FLAGS — you can re-enable later if needed
     # ────────────────────────────────────────────────────────────
     DISABLE_READ_DAILY_TOTALS: bool = True
     DISABLE_SET_24H_DOSE: bool = True
