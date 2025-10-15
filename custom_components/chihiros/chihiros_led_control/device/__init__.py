@@ -4,46 +4,71 @@ from __future__ import annotations
 
 import inspect
 import sys
-from typing import Type
+from typing import Dict, Type
 
-from bleak import BleakScanner
-from bleak.backends.device import BLEDevice
-
-from ..exception import DeviceNotFound
+# Light import: base class only (no bleak here)
 from .base_device import BaseDevice
 
-# Import all known model classes so they are present in this module's namespace
-from .a2 import AII
-from .c2 import CII
-from .c2rgb import CIIRGB
-from .commander1 import Commander1
-from .commander4 import Commander4
-from .fallback import Fallback
-from .generic_rgb import GenericRGB
-from .generic_white import GenericWhite
-from .generic_wrgb import GenericWRGB
-from .tiny_terrarium_egg import TinyTerrariumEgg
-from .universal_wrgb import UniversalWRGB
-from .wrgb2 import WRGBII
-from .wrgb2_pro import WRGBIIPro
-from .wrgb2_slim import WRGBIISlim
-from .z_light_tiny import ZLightTiny
+# Lazy-built registry of MODEL_CODE -> class
+_CODE2MODEL: Dict[str, Type[BaseDevice]] | None = None
 
-# Try to include the doser model; skip gracefully if unavailable
-try:
-    from ...chihiros_doser_control.device.doser import Doser  # noqa: F401
-    _HAS_DOSER = True
-except ImportError:
-    Doser = None  # type: ignore[assignment]
-    _HAS_DOSER = False
 
-# Build a mapping of MODEL_CODE -> class by introspecting imported classes
-CODE2MODEL: dict[str, Type[BaseDevice]] = {}
-for _name, _obj in inspect.getmembers(sys.modules[__name__]):
-    if inspect.isclass(_obj) and issubclass(_obj, BaseDevice):
-        for _code in getattr(_obj, "_model_codes", []):
-            if isinstance(_code, str) and _code:
-                CODE2MODEL[_code.upper()] = _obj
+def _safe_import(path: str):
+    """Import a module safely, returning the module or None on ImportError."""
+    try:
+        return __import__(path, fromlist=["*"])
+    except ImportError:
+        return None
+
+
+def _ensure_registry() -> Dict[str, Type[BaseDevice]]:
+    """Build the CODE2MODEL registry lazily by importing model modules only once."""
+    global _CODE2MODEL
+    if _CODE2MODEL is not None:
+        return _CODE2MODEL
+
+    # Current module path:
+    #   custom_components.chihiros.chihiros_led_control.device
+    root = __name__.split(".chihiros_led_control.device")[0]
+
+    modules_to_try = [
+        # LED families
+        __name__ + ".a2",
+        __name__ + ".c2",
+        __name__ + ".c2rgb",
+        __name__ + ".commander1",
+        __name__ + ".commander4",
+        __name__ + ".fallback",
+        __name__ + ".generic_rgb",
+        __name__ + ".generic_white",
+        __name__ + ".generic_wrgb",
+        __name__ + ".tiny_terrarium_egg",
+        __name__ + ".universal_wrgb",
+        __name__ + ".wrgb2",
+        __name__ + ".wrgb2_pro",
+        __name__ + ".wrgb2_slim",
+        __name__ + ".z_light_tiny",
+        # Optional doser model; skip if the doser package isn't present
+        f"{root}.chihiros_doser_control.device.doser",
+    ]
+
+    code2model: Dict[str, Type[BaseDevice]] = {}
+    for mod_path in modules_to_try:
+        mod = _safe_import(mod_path)
+        if not mod:
+            continue
+        for name, obj in inspect.getmembers(mod):
+            if inspect.isclass(obj) and issubclass(obj, BaseDevice):
+                codes = getattr(obj, "_model_codes", [])
+                if not isinstance(codes, (list, tuple)):
+                    continue
+                for code in codes:
+                    if isinstance(code, str) and code:
+                        code2model[code.upper()] = obj
+
+    _CODE2MODEL = code2model
+    return _CODE2MODEL
+
 
 def get_model_class_from_name(device_name: str) -> Type[BaseDevice]:
     """Return the device class for a given BLE advertised name.
@@ -51,50 +76,42 @@ def get_model_class_from_name(device_name: str) -> Type[BaseDevice]:
     Matches by prefix so names like 'DYDOSED203E0FEFCBC' resolve with codes
     ['DYDOSED2', 'DYDOSED', 'DYDOSE'].
     """
+    from .fallback import Fallback  # cheap
+
     if not device_name:
         return Fallback
+
     up = device_name.upper()
+    registry = _ensure_registry()
 
     # Exact match first
-    if up in CODE2MODEL:
-        return CODE2MODEL[up]
+    if up in registry:
+        return registry[up]
 
     # Prefix match: prefer the longest matching code
     best_cls: Type[BaseDevice] | None = None
     best_len = -1
-    for code, cls in CODE2MODEL.items():
+    for code, cls in registry.items():
         if up.startswith(code) and len(code) > best_len:
             best_cls = cls
             best_len = len(code)
     return best_cls or Fallback
 
+
 async def get_device_from_address(device_address: str) -> BaseDevice:
-    """Instantiate the correct device class from a MAC address."""
+    """Instantiate the correct device class from a MAC address (lazy bleak import)."""
+    from bleak import BleakScanner  # lazy
+
     ble_dev = await BleakScanner.find_device_by_address(device_address)
     if ble_dev and ble_dev.name:
         model_class = get_model_class_from_name(ble_dev.name)
         return model_class(ble_dev)
+    from ..exception import DeviceNotFound  # local, lightweight
     raise DeviceNotFound
 
+
 __all__ = [
-    "ZLightTiny",
-    "TinyTerrariumEgg",
-    "AII",
-    "Commander1",
-    "Commander4",
-    "WRGBII",
-    "WRGBIIPro",
-    "WRGBIISlim",
-    "CII",
-    "CIIRGB",
-    "UniversalWRGB",
-    "Fallback",
     "BaseDevice",
-    "CODE2MODEL",
     "get_device_from_address",
     "get_model_class_from_name",
-    "GenericRGB",
-    "GenericWhite",
-    "GenericWRGB",
-] + (["Doser"] if _HAS_DOSER else [])
-
+]

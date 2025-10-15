@@ -40,42 +40,86 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import dataclass
+from datetime import datetime  # kept for external callers / parity
+from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Optional, Set, Tuple
+
+# Windows CLI nicety; harmless elsewhere
 if os.name == "nt":
     try:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
     except Exception:
         pass
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Callable, Iterable, List, Optional, Set, Tuple
 
-import typer
-from bleak import BleakClient, BleakScanner
-
-# Import the shared protocol & encoders
-from ..protocol import (
-    UART_SERVICE, UART_RX, UART_TX,
-    CMD_MANUAL_DOSE, MODE_MANUAL_DOSE,
-    dose_ml,
-    build_totals_query_5b, parse_totals_frame,
-    parse_log_blob, decode_records, build_device_state, to_ctl_lines,
-    send_and_await_ack,
-)
-from ..dosingcommands import (
-    create_set_time_command,
-    create_switch_to_auto_mode_dosing_pump_command,
-)
-
-app = typer.Typer(help="Chihiros Doser (base app)")
+# Typing-time only; avoid importing bleak / typer at runtime unless needed
+if TYPE_CHECKING:
+    from bleak import BleakClient  # type: ignore
+else:
+    BleakClient = Any
 
 _LOG = logging.getLogger("chihiros.doser")
-P = typer.echo
+P = print  # replaced by typer.echo when CLI wiring is active
+
+
+# ────────────────────────────────────────────────────────────────
+# Helpers to detect HA and lazy-import heavy deps
+# ────────────────────────────────────────────────────────────────
+def _is_ha_runtime() -> bool:
+    try:
+        import homeassistant  # type: ignore
+        return True
+    except Exception:
+        return False
+
+
+def _bleak():
+    from bleak import BleakClient, BleakScanner  # type: ignore
+    return BleakClient, BleakScanner
+
+
+def _protocol():
+    from ..protocol import (  # type: ignore
+        UART_SERVICE, UART_RX, UART_TX,
+        CMD_MANUAL_DOSE, MODE_MANUAL_DOSE,
+        dose_ml,
+        build_totals_query_5b, parse_totals_frame,
+        parse_log_blob, decode_records, build_device_state, to_ctl_lines,
+        send_and_await_ack,
+    )
+    return {
+        "UART_SERVICE": UART_SERVICE,
+        "UART_RX": UART_RX,
+        "UART_TX": UART_TX,
+        "CMD_MANUAL_DOSE": CMD_MANUAL_DOSE,
+        "MODE_MANUAL_DOSE": MODE_MANUAL_DOSE,
+        "dose_ml": dose_ml,
+        "build_totals_query_5b": build_totals_query_5b,
+        "parse_totals_frame": parse_totals_frame,
+        "parse_log_blob": parse_log_blob,
+        "decode_records": decode_records,
+        "build_device_state": build_device_state,
+        "to_ctl_lines": to_ctl_lines,
+        "send_and_await_ack": send_and_await_ack,
+    }
+
+
+def _dosingcommands():
+    from ..dosingcommands import (  # type: ignore
+        create_set_time_command,
+        create_switch_to_auto_mode_dosing_pump_command,
+        create_command_encoding_dosing_pump,
+    )
+    return {
+        "create_set_time_command": create_set_time_command,
+        "create_switch_to_auto_mode_dosing_pump_command": create_switch_to_auto_mode_dosing_pump_command,
+        "create_command_encoding_dosing_pump": create_command_encoding_dosing_pump,
+    }
 
 
 # ────────────────────────────────────────────────────────────────
 # Weekday helpers (local copy to avoid LED package dependency)
 # ────────────────────────────────────────────────────────────────
-class WeekdaySelect(typer.ParamType):
+class WeekdaySelect:
     name = "weekday"
 
     _aliases = {
@@ -89,11 +133,12 @@ class WeekdaySelect(typer.ParamType):
         "everyday": 127, "daily": 127, "all": 127
     }
 
-    def convert(self, value: str, param, ctx):
+    def convert(self, value: str, *_args):
         v = (value or "").strip().lower()
         if v in self._aliases:
             return self._aliases[v]
-        self.fail(f"Invalid weekday value: {value}", param, ctx)
+        raise ValueError(f"Invalid weekday value: {value}")
+
 
 def encode_selected_weekdays(values: Iterable[str | int]) -> int:
     """Return a 7-bit mask. Accepts strings (mon..sun,everyday) or ints."""
@@ -103,29 +148,36 @@ def encode_selected_weekdays(values: Iterable[str | int]) -> int:
         if isinstance(v, int):
             mask |= (v & 0x7F)
         else:
-            mask |= ws.convert(str(v), None, None) & 0x7F
+            mask |= ws.convert(str(v)) & 0x7F
     return mask or 127  # default everyday
 
 
 # ────────────────────────────────────────────────────────────────
 # BLE helper
 # ────────────────────────────────────────────────────────────────
-async def _resolve_ble_or_fail(address_or_name: str) -> BleakClient:
+async def _resolve_ble_or_fail(address_or_name: str) -> "BleakClient":
     """Resolve a BLE device by MAC/name and return a BleakClient."""
-    s = address_or_name.strip()
-    # If it already looks like a MAC, try it directly
+    BleakClient, BleakScanner = _bleak()
+    s = (address_or_name or "").strip()
+    # If it looks like a MAC, try it directly
     if ":" in s and len(s) >= 17:
         return BleakClient(s)
-    # Else scan by name prefix
+    # Else scan by name prefix then exact address
     devices = await BleakScanner.discover(timeout=6.0)
     for d in devices:
-        if d.name and s.lower() in d.name.lower():
+        if getattr(d, "name", None) and s.lower() in d.name.lower():
             return BleakClient(d)
-    # Fallback: exact match on address string
     for d in devices:
-        if s.lower() == (d.address or "").lower():
+        if s.lower() == (getattr(d, "address", "") or "").lower():
             return BleakClient(d)
-    raise typer.BadParameter(f"BLE device not found: {address_or_name}")
+    # Prefer not to import typer in HA just to raise an error
+    if _is_ha_runtime():
+        raise RuntimeError(f"BLE device not found: {address_or_name}")
+    try:
+        import typer  # type: ignore
+        raise typer.BadParameter(f"BLE device not found: {address_or_name}")
+    except Exception:
+        raise RuntimeError(f"BLE device not found: {address_or_name}")
 
 
 NotifyCallback = Callable[[str, bytearray], None]
@@ -139,7 +191,7 @@ class _Callbacks:
 class DoserDevice:
     """Minimal BLE client for the doser using Nordic UART."""
 
-    def __init__(self, client: BleakClient):
+    def __init__(self, client: "BleakClient"):
         self._client = client
         self._callbacks = _Callbacks(notify=set())
         self._log = _LOG
@@ -149,7 +201,9 @@ class DoserDevice:
         self._log.setLevel(getattr(logging, level.upper(), logging.INFO))
 
     # Public: connect / disconnect
-    async def connect(self) -> BleakClient:
+    async def connect(self) -> "BleakClient":
+        prot = _protocol()
+        UART_SERVICE = prot["UART_SERVICE"]
         if not self._client.is_connected:
             await self._client.connect()
             # Confirm UART service is present (best-effort)
@@ -170,6 +224,8 @@ class DoserDevice:
 
     # Public: notifications on TX
     async def start_notify_tx(self) -> None:
+        UART_TX = _protocol()["UART_TX"]
+
         def _cb(handle: int, data: bytearray):
             for fn in list(self._callbacks.notify):
                 try:
@@ -180,6 +236,7 @@ class DoserDevice:
         await self._client.start_notify(UART_TX, _cb)
 
     async def stop_notify_tx(self) -> None:
+        UART_TX = _protocol()["UART_TX"]
         try:
             await self._client.stop_notify(UART_TX)
         except Exception:
@@ -194,6 +251,7 @@ class DoserDevice:
     # Public: writes
     async def set_dosing_pump_manuell_ml(self, ch_id: int, ml: float | int | str) -> None:
         """Immediate one-shot dose using 25.6+0.1 encoding (A5/27)."""
+        dose_ml = _protocol()["dose_ml"]
         client = await self.connect()
         await dose_ml(client, channel_1based=(int(ch_id) + 1), ml=ml)
 
@@ -204,6 +262,14 @@ class DoserDevice:
           - 90/09 (set time)
           - 165/32 [ch, catch_up=0, active=1] (await ACK 0x07)
         """
+        prot = _protocol()
+        cmds = _dosingcommands()
+        UART_RX = prot["UART_RX"]
+        CMD_MANUAL_DOSE = prot["CMD_MANUAL_DOSE"]
+        send_and_await_ack = prot["send_and_await_ack"]
+        create_set_time_command = cmds["create_set_time_command"]
+        create_switch_to_auto_mode_dosing_pump_command = cmds["create_switch_to_auto_mode_dosing_pump_command"]
+
         client = await self.connect()
 
         # Set time
@@ -227,11 +293,12 @@ class DoserDevice:
 
     async def raw_dosing_pump(self, cmd_id: int, mode: int, params: List[int], repeats: int = 1) -> None:
         """Send a raw A5 frame."""
+        UART_RX = _protocol()["UART_RX"]
+        create_command = _dosingcommands()["create_command_encoding_dosing_pump"]
         client = await self.connect()
         msg_hi, msg_lo = 0, 0
-        from ..dosingcommands import create_command_encoding_dosing_pump  # lightweight
         for _ in range(int(repeats)):
-            frame = create_command_encoding_dosing_pump(cmd_id, mode, (msg_hi, msg_lo), [int(p) & 0xFF for p in params])
+            frame = create_command(cmd_id, mode, (msg_hi, msg_lo), [int(p) & 0xFF for p in params])
             await client.write_gatt_char(UART_RX, frame, response=True)
             msg_lo = (msg_lo + 1) & 0xFF
 
@@ -241,15 +308,18 @@ class DoserDevice:
         Passive listener that prints any A5 frames we can interpret into a CTL-style
         summary (enable flags, time HH:MM, weekdays, and amount mL).
         """
+        prot = _protocol()
+        parse_log_blob = prot["parse_log_blob"]
+        decode_records = prot["decode_records"]
+        build_device_state = prot["build_device_state"]
+        to_ctl_lines = prot["to_ctl_lines"]
+
         client = await self.connect()
         buf: list[str] = []
-        done: asyncio.Future = asyncio.get_running_loop().create_future()
 
         def _cb(_kind: str, payload: bytearray) -> None:
-            # We accept both UART TX and LED-style notifications here
             try:
                 b = bytes(payload)
-                # store as a line that parse_log_blob() accepts
                 buf.append(f'["{b[0] if b else 0}", "{b[5] if len(b)>5 else 0}", {list(b[6:-1])}]')
             except Exception:
                 pass
@@ -257,24 +327,20 @@ class DoserDevice:
         await self.start_notify_tx()
         self.add_notify_callback(_cb)
         try:
-            try:
-                await asyncio.sleep(max(0.3, float(timeout_s)))
-            finally:
-                # Build a synthetic "log" and parse it
-                text = "\n".join(buf)
-                recs = parse_log_blob(text)
-                dec = decode_records(recs)
-                state = build_device_state(dec)
-                lines = to_ctl_lines(state)
-                # Filter by channel if requested
-                if ch_id is not None:
-                    prefix = f"ch{int(ch_id)}."
-                    lines = [ln for ln in lines if ln.startswith(prefix)]
-                if lines:
-                    for ln in lines:
-                        P(ln)
-                else:
-                    P("No auto schedule information observed in the window.")
+            await asyncio.sleep(max(0.3, float(timeout_s)))
+            text = "\n".join(buf)
+            recs = parse_log_blob(text)
+            dec = decode_records(recs)
+            state = build_device_state(dec)
+            lines = to_ctl_lines(state)
+            if ch_id is not None:
+                prefix = f"ch{int(ch_id)}."
+                lines = [ln for ln in lines if ln.startswith(prefix)]
+            if lines:
+                for ln in lines:
+                    P(ln)
+            else:
+                P("No auto schedule information observed in the window.")
         finally:
             self.remove_notify_callback(_cb)
             await self.stop_notify_tx()
@@ -304,3 +370,24 @@ class DoserDevice:
         finally:
             self.remove_notify_callback(_cb)
             await self.stop_notify_tx()
+
+
+# ────────────────────────────────────────────────────────────────
+# Optional Typer app (CLI only; never during Home Assistant runtime)
+# ────────────────────────────────────────────────────────────────
+if not _is_ha_runtime():
+    try:
+        import typer  # type: ignore
+
+        app = typer.Typer(help="Chihiros Doser (base app)")
+
+        @app.callback()
+        def _root():
+            """Base app for chihirosdoserctl.py to extend."""
+            pass
+
+        P = typer.echo  # nicer CLI printing
+    except Exception:
+        app = None  # type: ignore
+else:
+    app = None  # type: ignore
