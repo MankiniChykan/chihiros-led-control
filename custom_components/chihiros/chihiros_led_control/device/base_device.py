@@ -9,7 +9,6 @@ from abc import ABC, ABCMeta
 from datetime import datetime
 from typing import Callable, Optional, Union, Sequence
 
-import typer
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from bleak.backends.service import BleakGATTCharacteristic  # type: ignore
@@ -23,8 +22,6 @@ from bleak_retry_connector import (
     establish_connection,
     retry_bluetooth_connection_error,
 )
-from typing_extensions import Annotated
-
 from .. import commands
 from ..const import UART_RX_CHAR_UUID, UART_TX_CHAR_UUID
 from ..exception import CharacteristicMissingError
@@ -201,7 +198,7 @@ class BaseDevice(ABC):
 
     async def async_set_color_brightness(
         self,
-        brightness: Annotated[int, typer.Argument(min=0, max=140)],
+        brightness: int,
         color: str | int = 0,
     ) -> None:
         """Set brightness of a color."""
@@ -222,9 +219,7 @@ class BaseDevice(ABC):
 # set_brightnes to async_set_brightnes in class BaseDevice
 # ────────────────────────────────────────────────────────────────   
 
-    async def async_set_brightness(
-        self, brightness: Annotated[int, typer.Argument(min=0, max=140)]
-    ) -> None:
+    async def async_set_brightness(self, brightness: int) -> None:
         """Set overall brightness (maps to the default color channel)."""
         await self.async_set_color_brightness(brightness=brightness, color=0)
 
@@ -268,13 +263,11 @@ class BaseDevice(ABC):
 
     async def get_add_setting(
         self,
-        sunrise: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
-        sunset: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
-        max_brightness: Annotated[int, typer.Option(max=100, min=0)] = 100,
-        ramp_up_in_minutes: Annotated[int, typer.Option(min=0, max=150)] = 0,
-        weekdays: Annotated[list[WeekdaySelect], typer.Option()] = [
-            WeekdaySelect.everyday
-        ],
+        sunrise: datetime,
+        sunset: datetime,
+        max_brightness: int = 100,
+        ramp_up_in_minutes: int = 0,
+        weekdays: Sequence[WeekdaySelect] | None = None,
     ) -> None:
         """Add an automation setting to the light."""
         cmd = commands.create_add_auto_setting_command(
@@ -283,7 +276,7 @@ class BaseDevice(ABC):
             sunset.time(),
             (max_brightness, 255, 255),
             ramp_up_in_minutes,
-            encode_selected_weekdays(weekdays),
+            encode_selected_weekdays(list(weekdays or [WeekdaySelect.everyday])),
         )
         await self._send_command(cmd, 3)
 
@@ -291,9 +284,7 @@ class BaseDevice(ABC):
 # rgb_brightness to get_rgb_brightness in class BaseDevice
 # ────────────────────────────────────────────────────────────────
 
-    async def get_rgb_brightness(
-        self, brightness: Annotated[Sequence[int], typer.Argument()]
-    ) -> None:
+    async def get_rgb_brightness(self, brightness: Sequence[int]) -> None:
         """
         Set per-channel brightness. Accepts 1, 3, or 4 values:
           • 1 → broadcast to R,G,B
@@ -329,17 +320,11 @@ class BaseDevice(ABC):
 
     async def get_add_rgb_setting(
         self,
-        sunrise: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
-        sunset: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
-        max_brightness: Annotated[tuple[int, int, int], typer.Option()] = (
-            100,
-            100,
-            100,
-        ),
-        ramp_up_in_minutes: Annotated[int, typer.Option(min=0, max=150)] = 0,
-        weekdays: Annotated[list[WeekdaySelect], typer.Option()] = [
-            WeekdaySelect.everyday
-        ],
+        sunrise: datetime,
+        sunset: datetime,
+        max_brightness: tuple[int, int, int] = (100, 100, 100),
+        ramp_up_in_minutes: int = 0,
+        weekdays: Sequence[WeekdaySelect] | None = None,
     ) -> None:
         """Add an automation setting to the RGB light."""
         cmd = commands.create_add_auto_setting_command(
@@ -348,7 +333,7 @@ class BaseDevice(ABC):
             sunset.time(),
             max_brightness,
             ramp_up_in_minutes,
-            encode_selected_weekdays(weekdays),
+            encode_selected_weekdays(list(weekdays or [WeekdaySelect.everyday])),
         )
         await self._send_command(cmd, 3)
 
@@ -358,12 +343,10 @@ class BaseDevice(ABC):
 
     async def get_remove_setting(
         self,
-        sunrise: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
-        sunset: Annotated[datetime, typer.Argument(formats=["%H:%M"])],
-        ramp_up_in_minutes: Annotated[int, typer.Option(min=0, max=150)] = 0,
-        weekdays: Annotated[list[WeekdaySelect], typer.Option()] = [
-            WeekdaySelect.everyday
-        ],
+        sunrise: datetime,
+        sunset: datetime,
+        ramp_up_in_minutes: int = 0,
+        weekdays: Sequence[WeekdaySelect] | None = None,
     ) -> None:
         """Remove an automation setting from the light."""
         cmd = commands.create_delete_auto_setting_command(
@@ -371,7 +354,7 @@ class BaseDevice(ABC):
             sunrise.time(),
             sunset.time(),
             ramp_up_in_minutes,
-            encode_selected_weekdays(weekdays),
+            encode_selected_weekdays(list(weekdays or [WeekdaySelect.everyday])),
         )
         await self._send_command(cmd, 3)
 
