@@ -1,8 +1,43 @@
 # custom_components/chihiros/chihiros_doser_control/device/doser_device.py
+"""Chihiros Doser BLE device wrapper + minimal Typer app.
+
+This module provides:
+- DoserDevice: a thin BLE helper around the Nordic UART service
+  used by the Chihiros dosing pump family.
+- A tiny Typer `app` (the parent CLI) which chihirosdoserctl.py
+  mounts and extends with more commands.
+- WeekdaySelect + encode_selected_weekdays utilities (kept local
+  to avoid cross-package deps).
+
+It is designed to match the on-wire behaviour observed in logs:
+  - A5/165 family for dosing writes:
+      * mode 0x1B (27): manual dose & weekly row
+      * mode 0x20 (32): activate/flags (auto mode switch)
+      * mode 0x15 (21): time-of-day helper seen alongside weekly
+      * mode 0x16 (22): interval/repeats (optional)
+  - 90/09: time set (YY,MM,DOW,HH,MM,SS)
+  - 5B/LED family for daily totals (mL×10 or ×100 auto-detected)
+
+All frames avoid 0x5A in payload bytes and rotate message IDs
+away from 0x5A in either byte, with XOR checksum over the body.
+
+The public methods here are intentionally small and opinionated:
+  - connect()/disconnect()
+  - start/stop notify on TX; add/remove notify callbacks
+  - set_dosing_pump_manuell_ml()
+  - enable_auto_mode_dosing_pump()
+  - read_dosing_pump_auto_settings()   (passive decode printer)
+  - read_dosing_container_status()     (passive decode printer)
+  - raw_dosing_pump()                  (raw A5 sender)
+
+The high-reliability write cadence (mode32 → mode27 → mode22 with
+ACK/heartbeat waits) lives in protocol.program_channel_weekly_with_interval()
+and is used by the CLI command in chihirosdoserctl.py.
+"""
+
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 if os.name == "nt":
@@ -10,879 +45,262 @@ if os.name == "nt":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except Exception:
         pass
-from abc import ABC, ABCMeta
-from datetime import datetime, time, timedelta
-from enum import Enum
-from pathlib import Path
-from typing import Callable, List, Optional, Union
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Callable, Iterable, List, Optional, Set, Tuple
 
 import typer
-from typing_extensions import Annotated
+from bleak import BleakClient, BleakScanner
 
-from bleak import BleakScanner
-from bleak.backends.device import BLEDevice
-from bleak.backends.scanner import AdvertisementData
-from bleak.backends.service import BleakGATTCharacteristic  # type: ignore
-from bleak.backends.service import BleakGATTServiceCollection
-from bleak.exc import BleakDBusError, BleakDeviceNotFoundError
-from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS
-from bleak_retry_connector import BleakError  # type: ignore
-from bleak_retry_connector import (
-    BleakClientWithServiceCache,
-    BleakNotFoundError,
-    establish_connection,
-    retry_bluetooth_connection_error,
+# Import the shared protocol & encoders
+from ..protocol import (
+    UART_SERVICE, UART_RX, UART_TX,
+    CMD_MANUAL_DOSE, MODE_MANUAL_DOSE,
+    dose_ml,
+    build_totals_query_5b, parse_totals_frame,
+    parse_log_blob, decode_records, build_device_state, to_ctl_lines,
+    send_and_await_ack,
+)
+from ..dosingcommands import (
+    create_set_time_command,
+    create_switch_to_auto_mode_dosing_pump_command,
 )
 
+app = typer.Typer(help="Chihiros Doser (base app)")
+
+_LOG = logging.getLogger("chihiros.doser")
+P = typer.echo
 
 
-# ─────────────────────────────────────────────────────────────────────
-# INLINE REPLACEMENTS for LED package deps (const / weekday_encoding / exception)
-# ─────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+# Weekday helpers (local copy to avoid LED package dependency)
+# ────────────────────────────────────────────────────────────────
+class WeekdaySelect(typer.ParamType):
+    name = "weekday"
 
-# Nordic UART UUIDs (same as your protocol file; keep here for Bleak service discovery)
-UART_SERVICE_UUID     = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-UART_RX_CHAR_UUID     = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  # write
-UART_TX_CHAR_UUID     = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  # notify
+    _aliases = {
+        "mon": 64, "monday": 64,
+        "tue": 32, "tuesday": 32,
+        "wed": 16, "wednesday": 16,
+        "thu": 8,  "thursday": 8,
+        "fri": 4,  "friday": 4,
+        "sat": 2,  "saturday": 2,
+        "sun": 1,  "sunday": 1,
+        "everyday": 127, "daily": 127, "all": 127
+    }
 
-class CharacteristicMissingError(RuntimeError):
-    """Raised when expected UART characteristics are not present."""
+    def convert(self, value: str, param, ctx):
+        v = (value or "").strip().lower()
+        if v in self._aliases:
+            return self._aliases[v]
+        self.fail(f"Invalid weekday value: {value}", param, ctx)
 
-class WeekdaySelect(Enum):
-    monday    = 64
-    tuesday   = 32
-    wednesday = 16
-    thursday  = 8
-    friday    = 4
-    saturday  = 2
-    sunday    = 1
-    everyday  = 127
-
-def encode_selected_weekdays(days: List[WeekdaySelect]) -> int:
-    if not days:
-        return 0
-    if WeekdaySelect.everyday in days:
-        return WeekdaySelect.everyday.value
+def encode_selected_weekdays(values: Iterable[str | int]) -> int:
+    """Return a 7-bit mask. Accepts strings (mon..sun,everyday) or ints."""
     mask = 0
-    for d in days:
-        if isinstance(d, WeekdaySelect):
-            mask |= d.value
+    ws = WeekdaySelect()
+    for v in values:
+        if isinstance(v, int):
+            mask |= (v & 0x7F)
         else:
+            mask |= ws.convert(str(v), None, None) & 0x7F
+    return mask or 127  # default everyday
+
+
+# ────────────────────────────────────────────────────────────────
+# BLE helper
+# ────────────────────────────────────────────────────────────────
+async def _resolve_ble_or_fail(address_or_name: str) -> BleakClient:
+    """Resolve a BLE device by MAC/name and return a BleakClient."""
+    s = address_or_name.strip()
+    # If it already looks like a MAC, try it directly
+    if ":" in s and len(s) >= 17:
+        return BleakClient(s)
+    # Else scan by name prefix
+    devices = await BleakScanner.discover(timeout=6.0)
+    for d in devices:
+        if d.name and s.lower() in d.name.lower():
+            return BleakClient(d)
+    # Fallback: exact match on address string
+    for d in devices:
+        if s.lower() == (d.address or "").lower():
+            return BleakClient(d)
+    raise typer.BadParameter(f"BLE device not found: {address_or_name}")
+
+
+NotifyCallback = Callable[[str, bytearray], None]
+
+
+@dataclass
+class _Callbacks:
+    notify: Set[NotifyCallback]
+
+
+class DoserDevice:
+    """Minimal BLE client for the doser using Nordic UART."""
+
+    def __init__(self, client: BleakClient):
+        self._client = client
+        self._callbacks = _Callbacks(notify=set())
+        self._log = _LOG
+
+    # Public: logging
+    def set_log_level(self, level: str = "INFO") -> None:
+        self._log.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    # Public: connect / disconnect
+    async def connect(self) -> BleakClient:
+        if not self._client.is_connected:
+            await self._client.connect()
+            # Confirm UART service is present (best-effort)
             try:
-                mask |= WeekdaySelect[str(d)].value  # type: ignore[index]
+                svcs = await self._client.get_services()
+                if UART_SERVICE not in {s.uuid.upper() for s in svcs.services}:
+                    self._log.debug("UART service not listed, continuing anyway.")
             except Exception:
                 pass
-    return mask & 0x7F
-
-# ─────────────────────────────────────────────────────────────────────
-# Use your existing helpers
-# ─────────────────────────────────────────────────────────────────────
-from .. import dosingcommands
-from ..protocol import (
-    _split_ml_25_6,
-    UART_TX,            # TX/notify UUID string
-    UART_RX,            # RX/write UUID string
-    parse_totals_frame,
-    build_totals_query_5b,
-)
-
-# CLI app
-app = typer.Typer(help="Chihiros doser control")
-
-# ─────────────────────────────────────────────────────────────────────
-# Local JSON state (stand-in for app/server)
-# ─────────────────────────────────────────────────────────────────────
-class _DoserStateStore:
-    """
-    Persist per-device state:
-      • manual dose history
-      • per-channel container volumes (mL)
-    File: ~/.chihiros_doser/state.json
-    """
-    def __init__(self) -> None:
-        base = Path(os.path.expanduser("~")) / ".chihiros_doser"
-        base.mkdir(parents=True, exist_ok=True)
-        self._path = base / "state.json"
-        if not self._path.exists():
-            self._path.write_text("{}", encoding="utf-8")
-
-    def _load(self) -> dict:
-        try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-    def _save(self, data: dict) -> None:
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(self._path)
-
-    def ensure_device(self, addr: str) -> dict:
-        data = self._load()
-        dev = data.setdefault(addr, {})
-        dev.setdefault("containers", {str(i): 0.0 for i in range(4)})
-        dev.setdefault("manual_history", [])
-        self._save(data)
-        return dev
-
-    def record_manual(self, addr: str, ch: int, ml: float) -> None:
-        data = self._load()
-        dev = data.setdefault(addr, {})
-        hist = dev.setdefault("manual_history", [])
-        hist.append({"ts": datetime.utcnow().isoformat() + "Z", "ch": int(ch), "ml": float(ml)})
-        self._save(data)
-
-    def adjust_container(self, addr: str, ch: int, delta_ml: float) -> None:
-        data = self._load()
-        dev = data.setdefault(addr, {})
-        cont = dev.setdefault("containers", {str(i): 0.0 for i in range(4)})
-        key = str(int(ch))
-        cont[key] = max(0.0, float(cont.get(key, 0.0)) + float(delta_ml))
-        self._save(data)
-
-    def set_container(self, addr: str, ch: int, ml: float) -> None:
-        data = self._load()
-        dev = data.setdefault(addr, {})
-        cont = dev.setdefault("containers", {str(i): 0.0 for i in range(4)})
-        cont[str(int(ch))] = max(0.0, float(ml))
-        self._save(data)
-
-    def get_containers(self, addr: str) -> dict[str, float]:
-        return {k: float(v) for k, v in self.ensure_device(addr)["containers"].items()}
-
-    def get_history(self, addr: str) -> list[dict]:
-        dev = self.ensure_device(addr)
-        return list(dev.get("manual_history", []))
-
-    def clear_history(self, addr: str) -> None:
-        data = self._load()
-        dev = data.setdefault(addr, {})
-        dev["manual_history"] = []
-        self._save(data)
-
-_STATE = _DoserStateStore()
-
-# ─────────────────────────────────────────────────────────────────────
-# Embedded BaseDevice (notify is explicit; not auto-started)
-# ─────────────────────────────────────────────────────────────────────
-DEFAULT_ATTEMPTS = 3
-DISCONNECT_DELAY = 120
-BLEAK_BACKOFF_TIME = 0.25
-
-
-class _classproperty(property):
-    def __get__(self, owner_self: object, owner_cls: ABCMeta) -> str:  # type: ignore
-        ret: str = self.fget(owner_cls)  # type: ignore
-        return ret
-
-
-def _is_ha_runtime() -> bool:
-    try:
-        import homeassistant  # type: ignore
-        return True
-    except Exception:
-        return False
-
-
-def _mk_ble_device(addr_or_ble: Union[BLEDevice, str]) -> BLEDevice:
-    if isinstance(addr_or_ble, BLEDevice):
-        return addr_or_ble
-    if _is_ha_runtime():
-        raise RuntimeError("In Home Assistant, pass a real BLEDevice (not a MAC string).")
-    mac = str(addr_or_ble).upper()
-    return BLEDevice(mac, None, 0)
-
-
-class BaseDevice(ABC):
-    """Base device with connection + UART resolve + explicit notify fan-out."""
-
-    _model_name: str | None = None
-    _model_codes: list[str] = []
-    _colors: dict[str, int] = {}
-    _msg_id = dosingcommands.next_message_id() if hasattr(dosingcommands, "next_message_id") else (0, 0)
-    _logger: logging.Logger
-
-    def __init__(
-        self,
-        ble_device: Union[BLEDevice, str],
-        advertisement_data: AdvertisementData | None = None,
-    ) -> None:
-        self._ble_device = _mk_ble_device(ble_device)
-        self._logger = logging.getLogger(self._ble_device.address.replace(":", "-"))
-        self._advertisement_data = advertisement_data
-        self._client: BleakClientWithServiceCache | None = None
-        self._disconnect_timer: asyncio.TimerHandle | None = None
-        self._operation_lock: asyncio.Lock = asyncio.Lock()
-        self._read_char: BleakGATTCharacteristic | None = None  # TX/notify
-        self._write_char: BleakGATTCharacteristic | None = None  # RX/write
-        self._connect_lock: asyncio.Lock = asyncio.Lock()
-        self._expected_disconnect = False
-        self.loop = asyncio.get_running_loop()
-
-        self._notify_active: bool = False
-        self._notify_callbacks: list[Callable[[BleakGATTCharacteristic, bytearray], None]] = []
-
-        assert self._model_name is not None
-
-    # ── info ──
-    def set_log_level(self, level: int | str) -> None:
-        if isinstance(level, str):
-            level = logging._nameToLevel.get(level, 20)
-        self._logger.setLevel(level)
-
-    def set_ble_device_and_advertisement_data(
-        self, ble_device: BLEDevice, advertisement_data: AdvertisementData
-    ) -> None:
-        self._ble_device = ble_device
-        self._advertisement_data = advertisement_data
-
-    @property
-    def current_msg_id(self) -> tuple[int, int]:
-        return self._msg_id
-
-    def get_next_msg_id(self) -> tuple[int, int]:
-        if hasattr(dosingcommands, "next_message_id"):
-            self._msg_id = dosingcommands.next_message_id(self._msg_id)  # type: ignore
-        else:
-            hi, lo = self._msg_id
-            lo = (lo + 1) & 0xFF
-            if lo == 0:
-                hi = (hi + 1) & 0xFF
-            self._msg_id = (hi, lo)
-        return self._msg_id
-
-    @_classproperty
-    def model_name(cls) -> str | None:  # type: ignore[override]
-        return cls._model_name
-
-    @_classproperty
-    def model_codes(cls) -> list[str]:  # type: ignore[override]
-        return cls._model_codes
-
-    @property
-    def colors(self) -> dict[str, int]:
-        return self._colors
-
-    @property
-    def address(self) -> str:
-        return self._ble_device.address
-
-    @property
-    def name(self) -> str:
-        if hasattr(self._ble_device, "name"):
-            return self._ble_device.name or self._ble_device.address
-        return self._ble_device.address
-
-    @property
-    def rssi(self) -> int | None:
-        if self._advertisement_data:
-            return self._advertisement_data.rssi
-        return None
-
-    # ── notify control ──
-    async def start_notify_tx(self) -> None:
-        await self._ensure_connected()
-        if not self._read_char:
-            raise CharacteristicMissingError("Read characteristic missing (UART TX)")
-        if self._notify_active:
-            return
-        assert self._client is not None
-        await self._client.start_notify(self._read_char, self._notification_handler)  # type: ignore[arg-type]
-        self._notify_active = True
-
-    async def stop_notify_tx(self) -> None:
-        if not self._notify_active:
-            return
-        if self._client and self._read_char and self._client.is_connected:
-            try:
-                await self._client.stop_notify(self._read_char)
-            except Exception:
-                self._logger.debug("%s: stop_notify failed (already stopped?)", self.name, exc_info=True)
-        self._notify_active = False
-
-    def add_notify_callback(self, cb: Callable[[BleakGATTCharacteristic, bytearray], None]) -> None:
-        if cb not in self._notify_callbacks:
-            self._notify_callbacks.append(cb)
-
-    def remove_notify_callback(self, cb: Callable[[BleakGATTCharacteristic, bytearray], None]) -> None:
-        try:
-            self._notify_callbacks.remove(cb)
-        except ValueError:
-            pass
-
-    def _notification_handler(self, sender: BleakGATTCharacteristic, data: bytearray) -> None:
-        # print(data.hex())  # uncomment for raw prints during debugging
-        self._logger.debug("%s: Notification received: %s", self.name, data.hex(" ").upper())
-        for cb in tuple(self._notify_callbacks):
-            try:
-                cb(sender, data)
-            except Exception:
-                self._logger.debug("%s: notify callback raised", self.name, exc_info=True)
-
-    # ── BLE I/O ──
-    async def _send_command(
-        self, commands: list[bytes] | bytes | bytearray, retry: int | None = None
-    ) -> None:
-        await self._ensure_connected()
-        if not isinstance(commands, list):
-            commands = [commands]
-        await self._send_command_while_connected(commands, retry)
-
-    async def _send_command_while_connected(
-        self, commands: list[bytes], retry: int | None = None
-    ) -> None:
-        self._logger.debug("%s: Sending commands %s", self.name, [c.hex() for c in commands])
-        if self._operation_lock.locked():
-            self._logger.debug(
-                "%s: Operation already in progress, waiting; RSSI: %s", self.name, self.rssi
-            )
-        async with self._operation_lock:
-            try:
-                await self._send_command_locked(commands)
-                return
-            except BleakNotFoundError:
-                self._logger.error(
-                    "%s: device not found / out of range; RSSI: %s", self.name, self.rssi, exc_info=True
-                )
-                raise
-            except CharacteristicMissingError as ex:
-                self._logger.debug("%s: characteristic missing: %s; RSSI: %s", self.name, ex, self.rssi, exc_info=True)
-                raise
-            except BLEAK_EXCEPTIONS:
-                self._logger.debug("%s: communication failed", self.name, exc_info=True)
-                raise
-
-        raise RuntimeError("Unreachable")
-
-    @retry_bluetooth_connection_error(DEFAULT_ATTEMPTS)
-    async def _send_command_locked(self, commands: list[bytes]) -> None:
-        try:
-            await self._execute_command_locked(commands)
-        except BleakDBusError as ex:
-            await asyncio.sleep(BLEAK_BACKOFF_TIME)
-            self._logger.debug(
-                "%s: RSSI: %s; Backing off %ss; Disconnect due to error: %s",
-                self.name, self.rssi, BLEAK_BACKOFF_TIME, ex
-            )
-            await self._execute_disconnect()
-            raise
-        except BleakError as ex:
-            self._logger.debug("%s: RSSI: %s; Disconnect due to error: %s", self.name, self.rssi, ex)
-            await self._execute_disconnect()
-            raise
-
-    async def _execute_command_locked(self, commands: list[bytes]) -> None:
-        assert self._client is not None  # nosec
-        if not self._read_char:
-            raise CharacteristicMissingError("Read characteristic missing")
-        if not self._write_char:
-            raise CharacteristicMissingError("Write characteristic missing")
-        for command in commands:
-            # Write with response improves reliability on some Windows BLE stacks
-            await self._client.write_gatt_char(self._write_char, command, response=True)
-            # tiny pacing to avoid back-to-back congestion
-            await asyncio.sleep(0.02)
-
-    def _disconnected(self, client: BleakClientWithServiceCache) -> None:
-        if self._expected_disconnect:
-            self._logger.debug("%s: Disconnected; RSSI: %s", self.name, self.rssi)
-            return
-        self._logger.warning("%s: Device unexpectedly disconnected; RSSI: %s", self.name, self.rssi)
-
-    def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> bool:
-        # TX (notify/read)
-        for characteristic in [UART_TX_CHAR_UUID]:
-            if char := services.get_characteristic(characteristic):
-                self._read_char = char
-                break
-        # RX (write)
-        for characteristic in [UART_RX_CHAR_UUID]:
-            if char := services.get_characteristic(characteristic):
-                self._write_char = char
-                break
-        return bool(self._read_char and self._write_char)
-
-    async def _ensure_connected(self) -> None:
-        if self._connect_lock.locked():
-            self._logger.debug(
-                "%s: Connection already in progress; RSSI: %s", self.name, self.rssi
-            )
-        if self._client and self._client.is_connected:
-            self._reset_disconnect_timer()
-            return
-
-        async with self._connect_lock:
-            if self._client and self._client.is_connected:
-                self._reset_disconnect_timer()
-                return
-
-            self._logger.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
-
-            if isinstance(self._ble_device, BLEDevice):
-                device_arg: Union[str, BLEDevice] = self._ble_device
-                kwargs = {
-                    "use_services_cache": True,
-                    "ble_device_callback": lambda: self._ble_device,  # type: ignore[return-value]
-                }
-            else:
-                device_arg = self._ble_device.address  # type: ignore[attr-defined]
-                kwargs = {"use_services_cache": True}
-
-            client = await establish_connection(
-                BleakClientWithServiceCache, device_arg, self.name, self._disconnected, **kwargs
-            )
-
-            self._logger.debug("%s: Connected; RSSI: %s", self.name, self.rssi)
-
-            services = client.services or await client.get_services()
-            resolved = self._resolve_characteristics(services)
-
-            self._client = client
-            self._reset_disconnect_timer()
-
-            if not resolved:
-                raise CharacteristicMissingError("Failed to resolve UART characteristics")
-
-    # public helpers
-    async def connect(self) -> BleakClientWithServiceCache:
-        await self._ensure_connected()
-        assert self._client is not None  # nosec
         return self._client
-
-    @property
-    def client(self) -> BleakClientWithServiceCache | None:
-        return self._client
-
-    def _reset_disconnect_timer(self) -> None:
-        if self._disconnect_timer:
-            self._disconnect_timer.cancel()
-        self._expected_disconnect = False
-        self._disconnect_timer = self.loop.call_later(DISCONNECT_DELAY, self._disconnect)
 
     async def disconnect(self) -> None:
-        self._logger.debug("%s: Disconnecting", self.name)
-        await self._execute_disconnect()
-
-    async def _execute_disconnect(self) -> None:
-        async with self._connect_lock:
-            read_char = self._read_char
-            client = self._client
-            self._expected_disconnect = True
-            self._client = None
-            self._read_char = None
-            self._write_char = None
-
-            self._notify_callbacks.clear()
-            self._notify_active = False
-
-            if client and client.is_connected:
-                if read_char:
-                    try:
-                        await client.stop_notify(read_char)
-                    except Exception:
-                        self._logger.debug("%s: Failed to stop notifications", self.name, exc_info=True)
-                await client.disconnect()
-
-    def _disconnect(self) -> None:
-        self._disconnect_timer = None
-        asyncio.create_task(self._execute_timed_disconnect())
-
-    async def _execute_timed_disconnect(self) -> None:
-        self._logger.debug("%s: Disconnecting after timeout of %s", self.name, DISCONNECT_DELAY)
-        await self._execute_disconnect()
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Doser device
-# ─────────────────────────────────────────────────────────────────────
-class DoserDevice(BaseDevice):
-    """Doser-specific commands mixed onto the common BLE BaseDevice."""
-
-    _model_name = "Doser"
-    _model_codes = ["DYDOSED", "DYDOSE", "DOSER"]
-    _colors: dict[str, int] = {}
-
-    def __init__(self, device_or_addr: BLEDevice | str) -> None:
-        super().__init__(device_or_addr)
-
-    @staticmethod
-    def _add_minutes(t: time, delta_min: int) -> time:
-        anchor = datetime(2000, 1, 1, t.hour, t.minute)
-        return (anchor + timedelta(minutes=delta_min)).time()
-
-    async def send_frames(
-        self,
-        frames: list[bytes],
-        inter_delay_s: float = 0.12,
-        listen_s: float = 0.0,
-        tap_notifications: bool = True,
-        print_hex: bool = False,
-    ) -> list[bytes]:
-        """Send a burst of frames and optionally listen/collect notifications."""
-        await self.connect()
-        collected: list[bytes] = []
-
-        def _tap(_c: BleakGATTCharacteristic, data: bytearray) -> None:
-            if print_hex:
-                print(data.hex())
-            collected.append(bytes(data))
-
-        if tap_notifications:
-            await self.start_notify_tx()
-            self.add_notify_callback(_tap)
-
         try:
-            for pkt in frames:
-                await self._send_command(pkt, 1)
-                await asyncio.sleep(inter_delay_s)
-            if listen_s > 0:
-                await asyncio.sleep(listen_s)
-        finally:
-            if tap_notifications:
-                self.remove_notify_callback(_tap)
+            if self._client.is_connected:
+                await self._client.disconnect()
+        except Exception:
+            pass
+
+    # Public: notifications on TX
+    async def start_notify_tx(self) -> None:
+        def _cb(handle: int, data: bytearray):
+            for fn in list(self._callbacks.notify):
                 try:
-                    await self.stop_notify_tx()
+                    fn("tx", data)
                 except Exception:
-                    pass
+                    self._log.exception("notify-callback error")
 
-        return collected
+        await self._client.start_notify(UART_TX, _cb)
 
-    async def raw_dosing_pump(
-        self,
-        cmd_id: int,
-        mode: int,
-        params: Optional[List[int]] = None,
-        repeats: int = 3,
-    ) -> None:
-        """Send a raw A5 frame (165/…) with checksum and msg-id handled."""
-        p = params or []
-        pkt = dosingcommands._create_command_encoding_dosing_pump(  # type: ignore[attr-defined]
-            cmd_id, mode, self.get_next_msg_id(), p
-        )
-        await self._send_command(pkt, repeats)
+    async def stop_notify_tx(self) -> None:
+        try:
+            await self._client.stop_notify(UART_TX)
+        except Exception:
+            pass
 
-    async def set_dosing_pump_manuell_ml(self, ch_id: int, ch_ml: float) -> None:
-        """
-        Immediate dose on channel using 25.6-bucket + 0.1 remainder.
+    def add_notify_callback(self, cb: NotifyCallback) -> None:
+        self._callbacks.notify.add(cb)
 
-        Sequence:
-          • 90/4 ack
-          • time-sync (x2)
-          • 165/4 acks (4 and 5)
-          • 165/manual-dose (hi/lo 25.6+0.1)
-        Then listen ~8s for late notifications. Persist locally.
-        """
-        hi, lo = _split_ml_25_6(ch_ml)
+    def remove_notify_callback(self, cb: NotifyCallback) -> None:
+        self._callbacks.notify.discard(cb)
 
-        prelude = [
-            dosingcommands.create_order_confirmation(self.get_next_msg_id(), 90, 4, 1),
-            dosingcommands.create_set_time_command(self.get_next_msg_id()),
-            dosingcommands.create_set_time_command(self.get_next_msg_id()),
-            dosingcommands.create_order_confirmation(self.get_next_msg_id(), 165, 4, 4),
-            dosingcommands.create_order_confirmation(self.get_next_msg_id(), 165, 4, 5),
-        ]
-        manual = dosingcommands.create_add_dosing_pump_command_manuell_ml(
-            self.get_next_msg_id(), ch_id, hi, lo
-        )
-
-        frames = prelude + [manual]
-        await self.send_frames(frames, inter_delay_s=0.15, listen_s=8.0, tap_notifications=True, print_hex=False)
-
-        # Persist locally as a stand-in for the app/server
-        _STATE.record_manual(self.address, ch_id, ch_ml)
-        _STATE.adjust_container(self.address, ch_id, -ch_ml)
-
-    async def add_setting_dosing_pump(
-        self,
-        performance_time: time,
-        ch_id: int,
-        weekdays_mask: int,
-        ch_ml_tenths: int,
-        prefer_hilo: bool | None = None,
-    ) -> None:
-        """Program a weekly 24h dose entry at HH:MM and ensure auto mode is active."""
-        prelude = [
-            dosingcommands.create_order_confirmation(self.get_next_msg_id(), 90, 4, 1),
-            dosingcommands.create_set_time_command(self.get_next_msg_id()),
-            dosingcommands.create_set_time_command(self.get_next_msg_id()),
-            dosingcommands.create_order_confirmation(self.get_next_msg_id(), 165, 4, 4),
-            dosingcommands.create_order_confirmation(self.get_next_msg_id(), 165, 4, 5),
-            dosingcommands.create_switch_to_auto_mode_dosing_pump_command(self.get_next_msg_id(), ch_id),
-        ]
-        for f in prelude:
-            await self._send_command(f, 3)
-
-        if prefer_hilo is True:
-            use_hilo = True
-        elif prefer_hilo is False:
-            use_hilo = False
-        else:
-            use_hilo = ch_ml_tenths > 255  # >25.5 mL/day → hi/lo scheme
-
-        if use_hilo:
-            create_hi_lo = getattr(dosingcommands, "create_schedule_weekly_hi_lo", None)
-            if callable(create_hi_lo):
-                daily_ml = ch_ml_tenths / 10.0
-                frames = create_hi_lo(
-                    performance_time=performance_time,
-                    msg_id_time=self.get_next_msg_id(),
-                    msg_id_amount=self.get_next_msg_id(),
-                    ch_id=ch_id,
-                    weekdays_mask=weekdays_mask,
-                    daily_ml=daily_ml,
-                    enabled=True,
-                )
-                for pkt in frames:
-                    await self._send_command(pkt, 3)
-            else:
-                set_time0 = dosingcommands.create_auto_mode_dosing_pump_command_time(
-                    performance_time, self.get_next_msg_id(), ch_id, enabled=True
-                )
-                await self._send_command(set_time0, 3)
-                add = dosingcommands.create_add_auto_setting_command_dosing_pump(
-                    performance_time, self.get_next_msg_id(), ch_id, weekdays_mask, ch_ml_tenths
-                )
-                await self._send_command(add, 3)
-        else:
-            set_time0 = dosingcommands.create_auto_mode_dosing_pump_command_time(
-                performance_time, self.get_next_msg_id(), ch_id, enabled=True
-            )
-            await self._send_command(set_time0, 3)
-
-            add = getattr(dosingcommands, "create_schedule_weekly_byte_amount", None)
-            if callable(add):
-                pkt = add(
-                    performance_time=performance_time,
-                    msg_id=self.get_next_msg_id(),
-                    ch_id=ch_id,
-                    weekdays_mask=weekdays_mask,
-                    daily_ml_tenths=int(ch_ml_tenths),
-                    enabled=True,
-                )
-            else:
-                pkt = dosingcommands.create_add_auto_setting_command_dosing_pump(
-                    performance_time, self.get_next_msg_id(), ch_id, weekdays_mask, ch_ml_tenths
-                )
-            await self._send_command(pkt, 3)
+    # Public: writes
+    async def set_dosing_pump_manuell_ml(self, ch_id: int, ml: float | int | str) -> None:
+        """Immediate one-shot dose using 25.6+0.1 encoding (A5/27)."""
+        client = await self.connect()
+        await dose_ml(client, channel_1based=(int(ch_id) + 1), ml=ml)
 
     async def enable_auto_mode_dosing_pump(self, ch_id: int) -> None:
-        switch_cmd = dosingcommands.create_switch_to_auto_mode_dosing_pump_command(self.get_next_msg_id(), ch_id)
-        time_cmd = dosingcommands.create_set_time_command(self.get_next_msg_id())
-        await self._send_command(switch_cmd, 3)
-        await self._send_command(time_cmd, 3)
-
-    async def read_daily_totals(self, timeout_s: float = 6.0, mode_5b: int | str = 0x22) -> Optional[List[float]]:
-        """Request daily totals via 0x5B; return [CH1..CH4] or None on timeout."""
-        if isinstance(mode_5b, str):
-            mode_5b = int(mode_5b, 0)  # accept "0x22" or "34"
-
-        got: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
-
-        def _on_notify(_char: BleakGATTCharacteristic, payload: bytearray) -> None:
-            try:
-                vals = parse_totals_frame(payload)
-                if vals and not got.done():
-                    got.set_result(bytes(payload))
-            except Exception:
-                pass
-
+        """
+        Switch channel to auto mode and sync device time.
+        Sequence:
+          - 90/09 (set time)
+          - 165/32 [ch, catch_up=0, active=1] (await ACK 0x07)
+        """
         client = await self.connect()
-        await self.start_notify_tx()
-        self.add_notify_callback(_on_notify)
-        try:
-            frame = build_totals_query_5b(mode_5b)
+
+        # Set time
+        msg_hi, msg_lo = 0, 0
+        frame_time = create_set_time_command((msg_hi, msg_lo))
+        await client.write_gatt_char(UART_RX, frame_time, response=True)
+
+        # Switch to auto
+        msg_hi, msg_lo = 0, 1
+        frame_auto = create_switch_to_auto_mode_dosing_pump_command((msg_hi, msg_lo), int(ch_id), 0, 1)
+        await send_and_await_ack(
+            client,
+            bytes(frame_auto),
+            expect_cmd=CMD_MANUAL_DOSE,
+            expect_ack_mode=0x07,
+            ack_timeout_ms=400,
+            heartbeat_min_ms=300,
+            heartbeat_max_ms=900,
+            retries=1,
+        )
+
+    async def raw_dosing_pump(self, cmd_id: int, mode: int, params: List[int], repeats: int = 1) -> None:
+        """Send a raw A5 frame."""
+        client = await self.connect()
+        msg_hi, msg_lo = 0, 0
+        from ..dosingcommands import create_command_encoding_dosing_pump  # lightweight
+        for _ in range(int(repeats)):
+            frame = create_command_encoding_dosing_pump(cmd_id, mode, (msg_hi, msg_lo), [int(p) & 0xFF for p in params])
+            await client.write_gatt_char(UART_RX, frame, response=True)
+            msg_lo = (msg_lo + 1) & 0xFF
+
+    # Public: “read” helpers (passive parse/printer)
+    async def read_dosing_pump_auto_settings(self, *, ch_id: int | None = None, timeout_s: float = 2.0) -> None:
+        """
+        Passive listener that prints any A5 frames we can interpret into a CTL-style
+        summary (enable flags, time HH:MM, weekdays, and amount mL).
+        """
+        client = await self.connect()
+        buf: list[str] = []
+        done: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        def _cb(_kind: str, payload: bytearray) -> None:
+            # We accept both UART TX and LED-style notifications here
             try:
-                await client.write_gatt_char(UART_RX, frame, response=True)
-            except Exception:
-                await client.write_gatt_char(UART_TX, frame, response=True)
-            await asyncio.sleep(0.05)
-            try:
-                payload = await asyncio.wait_for(got, timeout=timeout_s)
-                return parse_totals_frame(payload)  # type: ignore[return-value]
-            except asyncio.TimeoutError:
-                return None
-        finally:
-            self.remove_notify_callback(_on_notify)
-            try:
-                await self.stop_notify_tx()
+                b = bytes(payload)
+                # store as a line that parse_log_blob() accepts
+                buf.append(f'["{b[0] if b else 0}", "{b[5] if len(b)>5 else 0}", {list(b[6:-1])}]')
             except Exception:
                 pass
 
-    # convenience getter for local state
-    def get_local_containers(self) -> dict[str, float]:
-        return _STATE.get_containers(self.address)
-
-
-    # ─────────────────────────────────────────────────────────────
-    # Compatibility shims expected by chihirosdoserctl
-    # ─────────────────────────────────────────────────────────────
-    async def read_dosing_pump_auto_settings(
-        self,
-        ch_id: int | None = None,
-        timeout_s: float = 2.0,
-    ) -> Optional[List[float]]:
-        """
-        Back-compat: read the per-channel 24h totals.
-        Tries LED 0x5B mode 0x22 then 0x1E. Prints a friendly line and
-        returns the list [ch1..ch4] or None on timeout.
-        """
-        vals = await self.read_daily_totals(timeout_s=timeout_s, mode_5b=0x22)
-        if not vals:
-            vals = await self.read_daily_totals(timeout_s=timeout_s, mode_5b=0x1E)
-        # Print like the old CLI did (so existing callers don't have to format)
-        import typer as _typer
-        if not vals or len(vals) < 4:
-            _typer.echo("No totals frame received within timeout.")
-            return None
-        if ch_id is not None and 0 <= int(ch_id) <= 3:
-            _typer.echo(f"CH{int(ch_id)+1}: {vals[int(ch_id)]:.2f} mL (24h total)")
-        else:
-            _typer.echo(
-                f"24h totals (mL): CH1={vals[0]:.2f}, CH2={vals[1]:.2f}, "
-                f"CH3={vals[2]:.2f}, CH4={vals[3]:.2f}"
-            )
-        return vals
-
-    async def read_dosing_container_status(
-        self,
-        ch_id: int | None = None,
-        timeout_s: float = 0.0,   # kept for signature-compatibility
-    ) -> dict[str, float]:
-        """
-        Back-compat: show container volumes. We use the local cache
-        (acts as a stand-in for the app/server state).
-        Prints lines like the legacy method and also returns a dict.
-        """
-        vols = self.get_local_containers()
-        import typer as _typer
-        if ch_id is not None and 0 <= int(ch_id) <= 3:
-            ml = float(vols.get(str(int(ch_id)), 0.0))
-            _typer.echo(f"CH{int(ch_id)+1}: {ml:.1f} mL")
-        else:
-            for i in range(4):
-                ml = float(vols.get(str(i), 0.0))
-                _typer.echo(f"CH{i+1}: {ml:.1f} mL")
-        return vols
-
-# ─────────────────────────────────────────────────────────────────────
-# CLI wrappers (BLE actions)
-# ─────────────────────────────────────────────────────────────────────
-NOT_FOUND_MSG = "Device Not Found, Unreachable or Failed to Connect, ensure Chihiros app is not connected"
-
-async def _resolve_ble_or_fail(device_address: str) -> BLEDevice:
-    ble = await BleakScanner.find_device_by_address(device_address, timeout=10.0)
-    if not ble:
-        typer.echo(NOT_FOUND_MSG)
-        raise typer.Exit(1)
-    return ble
-
-def _handle_connect_errors(ex: Exception) -> None:
-    msg = str(ex).lower()
-    if (
-        isinstance(ex, BleakDeviceNotFoundError)
-        or "not found" in msg
-        or "unreachable" in msg
-        or "failed to connect" in msg
-    ):
-        typer.echo(NOT_FOUND_MSG)
-        raise typer.Exit(1)
-    raise ex
-
-@app.command("set-dosing-pump-manuell-ml")
-def cli_manual_ml(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC")],
-    ch_id: Annotated[int, typer.Option("--ch-id", min=0, max=3)],
-    ch_ml: Annotated[float, typer.Option("--ch-ml", min=0.2, max=999.9)],
-) -> None:
-    async def run():
-        dd: DoserDevice | None = None
+        await self.start_notify_tx()
+        self.add_notify_callback(_cb)
         try:
-            ble = await _resolve_ble_or_fail(device_address)
-            dd = DoserDevice(ble)
-            await dd.set_dosing_pump_manuell_ml(ch_id, ch_ml)
+            try:
+                await asyncio.sleep(max(0.3, float(timeout_s)))
+            finally:
+                # Build a synthetic "log" and parse it
+                text = "\n".join(buf)
+                recs = parse_log_blob(text)
+                dec = decode_records(recs)
+                state = build_device_state(dec)
+                lines = to_ctl_lines(state)
+                # Filter by channel if requested
+                if ch_id is not None:
+                    prefix = f"ch{int(ch_id)}."
+                    lines = [ln for ln in lines if ln.startswith(prefix)]
+                if lines:
+                    for ln in lines:
+                        P(ln)
+                else:
+                    P("No auto schedule information observed in the window.")
         finally:
-            if dd:
-                await dd.disconnect()
-    asyncio.run(run())
+            self.remove_notify_callback(_cb)
+            await self.stop_notify_tx()
 
-@app.command("probe-totals")
-def cli_probe_totals(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC")],
-    timeout_s: Annotated[float, typer.Option(min=0.5)] = 6.0,
-    mode_5b: Annotated[str, typer.Option(help="0x5B mode (e.g. 0x22 or 0x1E)")]= "0x22",
-) -> None:
-    async def run():
-        dd: DoserDevice | None = None
+    async def read_dosing_container_status(self, *, ch_id: int | None = None, timeout_s: float = 2.0) -> None:
+        """
+        Passive printer. If firmware emits container / tank status frames on TX,
+        this function will show them as raw hex. (We keep this generic until
+        we have stable decode samples across models.)
+        """
+        client = await self.connect()
+        got: list[str] = []
+
+        def _cb(_kind: str, payload: bytearray) -> None:
+            got.append(bytes(payload).hex(" ").upper())
+
+        await self.start_notify_tx()
+        self.add_notify_callback(_cb)
         try:
-            ble = await _resolve_ble_or_fail(device_address)
-            dd = DoserDevice(ble)
-            vals = await dd.read_daily_totals(timeout_s=timeout_s, mode_5b=mode_5b)
-            if vals and len(vals) >= 4:
-                typer.echo(f"Totals (ml): CH1={vals[0]:.2f}, CH2={vals[1]:.2f}, CH3={vals[2]:.2f}, CH4={vals[3]:.2f}")
+            await asyncio.sleep(max(0.3, float(timeout_s)))
+            if got:
+                P("Container/Tank notifications (raw):")
+                for line in got:
+                    P(f"  {line}")
             else:
-                typer.echo("No totals frame received within timeout.")
+                P("No container/tank notifications observed.")
         finally:
-            if dd:
-                await dd.disconnect()
-    asyncio.run(run())
-
-# ─────────────────────────────────────────────────────────────────────
-# NEW: Tiny CLI for local container volumes & manual history
-# ─────────────────────────────────────────────────────────────────────
-
-@app.command("show-containers")
-def cli_show_containers(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC (used as key for local store)")],
-) -> None:
-    # No BLE needed to view local cache
-    vols = _STATE.get_containers(device_address.upper())
-    for ch in range(4):
-        ml = vols.get(str(ch), 0.0)
-        typer.echo(f"CH{ch+1}: {ml:.1f} mL")
-
-@app.command("set-container")
-def cli_set_container(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC (used as key for local store)")],
-    ch_id: Annotated[int, typer.Option("--ch-id", min=0, max=3)],
-    ml: Annotated[float, typer.Option("--ml", help="Absolute content in mL", min=0.0)],
-) -> None:
-    _STATE.set_container(device_address.upper(), ch_id, ml)
-    typer.echo(f"Set CH{ch_id+1} to {ml:.1f} mL")
-
-@app.command("add-container")
-def cli_add_container(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC (used as key for local store)")],
-    ch_id: Annotated[int, typer.Option("--ch-id", min=0, max=3)],
-    delta: Annotated[float, typer.Option("--delta", help="Add (or subtract) mL; negative allowed")],
-) -> None:
-    _STATE.adjust_container(device_address.upper(), ch_id, delta)
-    new_ml = _STATE.get_containers(device_address.upper()).get(str(ch_id), 0.0)
-    sign = "+" if delta >= 0 else ""
-    typer.echo(f"Adjusted CH{ch_id+1} by {sign}{delta:.1f} mL → {new_ml:.1f} mL")
-
-@app.command("show-history")
-def cli_show_history(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC (used as key for local store)")],
-    limit: Annotated[int, typer.Option("--limit", help="Max entries to show", min=1)] = 20,
-) -> None:
-    hist = list(reversed(_STATE.get_history(device_address.upper())))
-    if not hist:
-        typer.echo("No manual dose history recorded.")
-        return
-    for row in hist[:limit]:
-        ts = row.get("ts", "?")
-        ch = int(row.get("ch", -1))
-        ml = float(row.get("ml", 0.0))
-        typer.echo(f"{ts}  CH{ch+1}: {ml:.1f} mL")
-
-@app.command("clear-history")
-def cli_clear_history(
-    device_address: Annotated[str, typer.Argument(help="BLE MAC (used as key for local store)")],
-) -> None:
-    _STATE.clear_history(device_address.upper())
-    typer.echo("Manual dose history cleared.")
-
-# ─────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    app()
+            self.remove_notify_callback(_cb)
+            await self.stop_notify_tx()

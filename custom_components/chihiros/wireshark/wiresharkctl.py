@@ -23,7 +23,7 @@ if str(TOOLS_DIR) not in sys.path:
 
 # Try to import helper modules from /tools
 try:
-    from .wireshark_core import parse_wireshark_stream, write_jsonl  # type: ignore
+    from ....tools.wireshark_core import parse_wireshark_stream, write_jsonl  # type: ignore
    
 except Exception:
     parse_wireshark_stream = None  # type: ignore
