@@ -196,7 +196,7 @@ else:
         "sat": WeekdaySelect.saturday, "saturday": WeekdaySelect.saturday,
         "sun": WeekdaySelect.sunday, "sunday": WeekdaySelect.sunday,
         "everyday": "ALL", "every day": "ALL", "any": "ALL", "all": "ALL",
-    })
+    }
 
     def _parse_weekdays_to_mask(value, fallback_mask: int = 0x7F) -> int:
         """Accept int mask, string 'Mon,Wed,Fri', or list of day strings; return 0..127 mask."""
