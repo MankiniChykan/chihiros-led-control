@@ -1,8 +1,6 @@
-# custom_components/chihiros/chihiros_doser_control/__init__.py
 from __future__ import annotations
 
 # Explicit public API so this module is import-safe for CLI/tests regardless of HA.
-# (The name is defined in both branches below.)
 __all__ = ["register_services"]
 
 # ────────────────────────────────────────────────────────────────
@@ -84,7 +82,7 @@ else:
         vol.Exclusive("address", "target"): str,
     })
 
-    # NEW: 24h config now accepts a real time-of-day and human-readable weekdays
+    # 24h config (kept, but registration gated by feature flag)
     SET_24H_SCHEMA = vol.Schema({
         vol.Exclusive("device_id", "target"): str,
         vol.Exclusive("address", "target"): str,
@@ -101,7 +99,30 @@ else:
         vol.Optional("weekday_mask", default=None): vol.Any(None, vol.All(vol.Coerce(int), vol.Range(min=0, max=0x7F))),
         vol.Optional("weekdays", default=None): vol.Any(str, [str]),
 
-        vol.Optional("catch_up", default=False): vol.Boolean(),  # Make up for missed doses
+        vol.Optional("catch_up", default=False): vol.Boolean(),
+    })
+
+    # Extra service schemas (matching services.yaml)
+    ENABLE_AUTO_SCHEMA = vol.Schema({
+        vol.Exclusive("device_id", "target"): str,
+        vol.Exclusive("address", "target"): str,
+        vol.Required("channel"): vol.All(vol.Coerce(int), vol.Range(min=1, max=4)),
+    })
+
+    READ_PASSIVE_SCHEMA = vol.Schema({
+        vol.Exclusive("device_id", "target"): str,
+        vol.Exclusive("address", "target"): str,
+        vol.Optional("channel"): vol.All(vol.Coerce(int), vol.Range(min=1, max=4)),
+        vol.Optional("timeout_s", default=2.0): vol.All(vol.Coerce(float), vol.Range(min=0.2, max=30.0)),
+    })
+
+    RAW_CMD_SCHEMA = vol.Schema({
+        vol.Exclusive("device_id", "target"): str,
+        vol.Exclusive("address", "target"): str,
+        vol.Required("cmd_id"): vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
+        vol.Required("mode"):   vol.All(vol.Coerce(int), vol.Range(min=0, max=255)),
+        vol.Required("params"): list,  # list of ints
+        vol.Optional("repeats", default=1): vol.All(vol.Coerce(int), vol.Range(min=1, max=20)),
     })
 
     # ────────────────────────────────────────────────────────────
@@ -219,6 +240,9 @@ else:
             pass
         try:
             frames.append(dp._encode(dp.CMD_MANUAL_DOSE, 0x1E, []))
+        except Exception:
+            pass
+        try:
             frames.append(dp._encode(dp.CMD_MANUAL_DOSE, 0x22, []))
         except Exception:
             pass
@@ -270,8 +294,10 @@ else:
             def _on_notify(_char, payload: bytearray) -> None:
                 try:
                     if isinstance(payload, (bytes, bytearray)) and len(payload) >= 6 and payload[0] in (0x5B, 91):
-                        _LOGGER.debug("dose: notify 0x5B mode=0x%02X raw=%s",
-                                      payload[5], bytes(payload).hex(" ").upper())
+                        _LOGGER.debug(
+                            "dose: notify 0x5B mode=0x%02X raw=%s",
+                            payload[5], bytes(payload).hex(" ").upper()
+                        )
                     vals = dp.parse_totals_frame(payload)
                     if vals and not got.done():
                         got.set_result(bytes(payload))
@@ -325,6 +351,223 @@ else:
         hass.services.async_register(DOMAIN, "dose_ml", _svc_dose, schema=DOSE_SCHEMA)
 
         # -------------------------
+        # Enable auto mode (and sync time)
+        # -------------------------
+        async def _svc_enable_auto(call: ServiceCall):
+            data = ENABLE_AUTO_SCHEMA(dict(call.data))
+
+            addr = data.get("address")
+            if not addr and (did := data.get("device_id")):
+                addr = await _resolve_address_from_device_id(hass, did)
+            if not addr:
+                raise HomeAssistantError("Provide address or a device_id linked to a BLE address")
+
+            channel = int(data["channel"])
+            ble_dev = bluetooth.async_ble_device_from_address(hass, addr.upper(), True)
+            if not ble_dev:
+                raise HomeAssistantError(f"Could not find BLE device for address {addr}")
+
+            from .dosingcommands import (
+                create_set_time_command,
+                create_switch_to_auto_mode_dosing_pump_command,
+            )
+
+            client = None
+            try:
+                client = await establish_connection(BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-enable-auto")
+                # 90/09 set time
+                msg_hi, msg_lo = 0, 0
+                frame_time = create_set_time_command((msg_hi, msg_lo))
+                await client.write_gatt_char(dp.UART_RX, frame_time, response=True)
+
+                # 165/32 switch to auto for channel-1 (wire 0-based)
+                msg_hi, msg_lo = 0, 1
+                wire_ch = max(1, min(channel, 4)) - 1
+                frame_auto = create_switch_to_auto_mode_dosing_pump_command((msg_hi, msg_lo), wire_ch, 0, 1)
+                await dp.send_and_await_ack(
+                    client,
+                    bytes(frame_auto),
+                    expect_cmd=dp.CMD_MANUAL_DOSE,
+                    expect_ack_mode=0x07,
+                    ack_timeout_ms=400,
+                    heartbeat_min_ms=300,
+                    heartbeat_max_ms=900,
+                    retries=1,
+                )
+            except BLEAK_EXC as e:
+                raise HomeAssistantError(f"BLE temporarily unavailable: {e}") from e
+            except Exception as e:
+                raise HomeAssistantError(f"Enable auto failed: {e}") from e
+            finally:
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+        hass.services.async_register(DOMAIN, "enable_auto_mode", _svc_enable_auto, schema=ENABLE_AUTO_SCHEMA)
+
+        # -------------------------
+        # Read auto settings (passive)
+        # -------------------------
+        async def _svc_read_auto(call: ServiceCall):
+            data = READ_PASSIVE_SCHEMA(dict(call.data))
+            addr = data.get("address")
+            if not addr and (did := data.get("device_id")):
+                addr = await _resolve_address_from_device_id(hass, did)
+            if not addr:
+                raise HomeAssistantError("Provide address or a device_id linked to a BLE address")
+
+            ch_id = data.get("channel")
+            timeout_s = float(data.get("timeout_s", 2.0))
+            ble_dev = bluetooth.async_ble_device_from_address(hass, addr.upper(), True)
+            if not ble_dev:
+                raise HomeAssistantError(f"Could not find BLE device for address {addr}")
+
+            buf: list[str] = []
+            client = None
+            try:
+                client = await establish_connection(BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-read-auto")
+
+                def _cb(_char, payload: bytearray) -> None:
+                    try:
+                        b = bytes(payload)
+                        buf.append(f'["{b[0] if b else 0}", "{b[5] if len(b)>5 else 0}", {list(b[6:-1])}]')
+                    except Exception:
+                        pass
+
+                await client.start_notify(UART_TX, _cb)
+                await asyncio.sleep(max(0.3, timeout_s))
+            except BLEAK_EXC as e:
+                raise HomeAssistantError(f"BLE temporarily unavailable: {e}") from e
+            finally:
+                if client:
+                    try:
+                        await client.stop_notify(UART_TX)
+                    except Exception:
+                        pass
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+            # Decode and present results
+            try:
+                recs = dp.parse_log_blob("\n".join(buf))
+                dec = dp.decode_records(recs)
+                state = dp.build_device_state(dec)
+                lines = dp.to_ctl_lines(state)
+                if ch_id is not None:
+                    prefix = f"ch{int(ch_id)}."
+                    lines = [ln for ln in lines if ln.startswith(prefix)]
+            except Exception as e:
+                raise HomeAssistantError(f"Decode failed: {e}") from e
+
+            message = "\n".join(lines) if lines else "No auto schedule information observed."
+            await hass.services.async_call(
+                "persistent_notification", "create",
+                {"title": "Chihiros Doser — Auto schedule", "message": message},
+                blocking=False,
+            )
+
+        hass.services.async_register(DOMAIN, "read_auto_settings", _svc_read_auto, schema=READ_PASSIVE_SCHEMA)
+
+        # -------------------------
+        # Read container/tank status (passive, raw hex)
+        # -------------------------
+        async def _svc_read_container(call: ServiceCall):
+            data = READ_PASSIVE_SCHEMA(dict(call.data))
+            addr = data.get("address")
+            if not addr and (did := data.get("device_id")):
+                addr = await _resolve_address_from_device_id(hass, did)
+            if not addr:
+                raise HomeAssistantError("Provide address or a device_id linked to a BLE address")
+
+            timeout_s = float(data.get("timeout_s", 2.0))
+            ble_dev = bluetooth.async_ble_device_from_address(hass, addr.upper(), True)
+            if not ble_dev:
+                raise HomeAssistantError(f"Could not find BLE device for address {addr}")
+
+            lines: list[str] = []
+            client = None
+            try:
+                client = await establish_connection(BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-read-container")
+
+                def _cb(_char, payload: bytearray) -> None:
+                    lines.append(bytes(payload).hex(" ").upper())
+
+                await client.start_notify(UART_TX, _cb)
+                await asyncio.sleep(max(0.3, timeout_s))
+            except BLEAK_EXC as e:
+                raise HomeAssistantError(f"BLE temporarily unavailable: {e}") from e
+            finally:
+                if client:
+                    try:
+                        await client.stop_notify(UART_TX)
+                    except Exception:
+                        pass
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+            msg = (
+                "Container/Tank notifications:\n  " + "\n  ".join(lines)
+                if lines
+                else "No container/tank notifications observed."
+            )
+            await hass.services.async_call(
+                "persistent_notification", "create",
+                {"title": "Chihiros Doser — Container status", "message": msg},
+                blocking=False,
+            )
+
+        hass.services.async_register(DOMAIN, "read_container_status", _svc_read_container, schema=READ_PASSIVE_SCHEMA)
+
+        # -------------------------
+        # Raw A5/5B command sender (advanced)
+        # -------------------------
+        async def _svc_raw_cmd(call: ServiceCall):
+            data = RAW_CMD_SCHEMA(dict(call.data))
+            addr = data.get("address")
+            if not addr and (did := data.get("device_id")):
+                addr = await _resolve_address_from_device_id(hass, did)
+            if not addr:
+                raise HomeAssistantError("Provide address or a device_id linked to a BLE address")
+
+            cmd_id = int(data["cmd_id"])
+            mode   = int(data["mode"])
+            params = [int(p) & 0xFF for p in (data.get("params") or [])]
+            repeats = int(data.get("repeats", 1))
+
+            ble_dev = bluetooth.async_ble_device_from_address(hass, addr.upper(), True)
+            if not ble_dev:
+                raise HomeAssistantError(f"Could not find BLE device for address {addr}")
+
+            from .dosingcommands import create_command_encoding_dosing_pump
+
+            client = None
+            try:
+                client = await establish_connection(BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-raw-cmd")
+                msg_hi, msg_lo = 0, 0
+                for _ in range(repeats):
+                    frame = create_command_encoding_dosing_pump(cmd_id, mode, (msg_hi, msg_lo), params)
+                    await client.write_gatt_char(dp.UART_RX, frame, response=True)
+                    msg_lo = (msg_lo + 1) & 0xFF
+            except BLEAK_EXC as e:
+                raise HomeAssistantError(f"BLE temporarily unavailable: {e}") from e
+            except Exception as e:
+                raise HomeAssistantError(f"Raw command failed: {e}") from e
+            finally:
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+        hass.services.async_register(DOMAIN, "raw_doser_command", _svc_raw_cmd, schema=RAW_CMD_SCHEMA)
+
+        # -------------------------
         # Read & print daily totals — DISABLED
         # -------------------------
         if DISABLE_READ_DAILY_TOTALS:
@@ -332,7 +575,6 @@ else:
                 raise HomeAssistantError("Disabled: 'read_daily_totals' is not available in this build.")
             hass.services.async_register(DOMAIN, "read_daily_totals", _svc_disabled_read)
         else:
-            # (Commented-out registration; preserved for later re-enable)
             # hass.services.async_register(DOMAIN, "read_daily_totals", _svc_read_totals, schema=READ_TOTALS_SCHEMA)
             pass
 
@@ -344,7 +586,6 @@ else:
                 raise HomeAssistantError("Disabled: 'set_24h_dose' is not available in this build.")
             hass.services.async_register(DOMAIN, "set_24h_dose", _svc_disabled_set24h)
         else:
-            # (Commented-out registration; preserved for later re-enable)
             # hass.services.async_register(DOMAIN, "set_24h_dose", _svc_set_24h, schema=SET_24H_SCHEMA)
             pass
 
@@ -373,8 +614,10 @@ else:
         def _on_notify(_char, payload: bytearray) -> None:
             try:
                 if isinstance(payload, (bytes, bytearray)) and len(payload) >= 6 and payload[0] in (0x5B, 91):
-                    _LOGGER.debug("read: notify 0x5B mode=0x%02X raw=%s",
-                                  payload[5], bytes(payload).hex(" ").upper())
+                    _LOGGER.debug(
+                        "read: notify 0x5B mode=0x%02X raw=%s",
+                        payload[5], bytes(payload).hex(" ").upper()
+                    )
                 vals = dp.parse_totals_frame(payload)
                 if vals and not got.done():
                     got.set_result(bytes(payload))
@@ -532,7 +775,7 @@ else:
                         pass
                 await asyncio.sleep(0.10)
 
-            # Notify user via persistent_notification (now shows time and English days)
+            # Notify user via persistent_notification
             msg = (
                 f"Configured 24-hour dosing for {addr_u}:\n"
                 f"  Channel: {channel}\n"
