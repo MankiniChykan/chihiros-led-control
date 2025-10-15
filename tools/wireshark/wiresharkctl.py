@@ -1,49 +1,42 @@
-# custom_components/chihiros/wireshark/wiresharkctl.py
+# tools/wireshark/wiresharkctl.py
 """Wireshark-related CLI for chihirosctl.
 
 All heavy helpers live outside Home Assistant in /tools:
-  - tools/wireshark_core.py
+  - tools/wireshark/wireshark_core.py
   - tools/btsnoop_to_jsonl.py
 """
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Any, List
-from datetime import datetime
 
 import typer
 from typing_extensions import Annotated
 
-# Ensure /tools is importable even when running under HA
-TOOLS_DIR = Path(__file__).resolve().parents[3] / "tools"
-if str(TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(TOOLS_DIR))
-
-# Try to import helper modules from /tools
+# Core helpers from the tools package (absolute imports; no sys.path hacks)
 try:
-    from ....tools.wireshark_core import parse_wireshark_stream, write_jsonl  # type: ignore
-   
+    from tools.wireshark.wireshark_core import parse_wireshark_stream, write_jsonl  # type: ignore
 except Exception:
     parse_wireshark_stream = None  # type: ignore
     write_jsonl = None  # type: ignore
 
+# BTSnoop helpers (absolute import)
 try:
-    from btsnoop_to_jsonl import iter_btsnoop_records, write_jsonl as write_jsonl_btsnoop  # type: ignore
+    from tools.btsnoop_to_jsonl import iter_btsnoop_records, write_jsonl as write_jsonl_btsnoop  # type: ignore
 except Exception:
     iter_btsnoop_records = None  # type: ignore
     write_jsonl_btsnoop = None  # type: ignore
 
-# Optional: doser protocol helpers for decode/encode & raw TX
+# Optional: protocol helpers from the HA integration (keep optional so HA isn’t required)
 try:
-    from ..chihiros_doser_control.protocol import (
+    from custom_components.chihiros.chihiros_doser_control.protocol import (  # type: ignore
         parse_log_blob,
         decode_records,
         build_device_state,
         to_ctl_lines,
     )
-    from ..chihiros_doser_control.device.doser_device import (  # type: ignore
+    from custom_components.chihiros.chihiros_doser_control.device.doser_device import (  # type: ignore
         DoserDevice,
         _resolve_ble_or_fail,
     )
@@ -54,15 +47,18 @@ except Exception:
 
 app = typer.Typer(help="Wireshark helpers (parse/peek/encode/decode/tx)")
 
+
 def _require_ws():
     if parse_wireshark_stream is None or write_jsonl is None:
-        typer.secho("Wireshark core helpers not available (tools/wireshark_core.py).", fg=typer.colors.RED)
+        typer.secho("Wireshark core helpers not available (tools/wireshark/wireshark_core.py).", fg=typer.colors.RED)
         raise typer.Exit(code=2)
+
 
 def _require_btsnoop():
     if iter_btsnoop_records is None or write_jsonl_btsnoop is None:
         typer.secho("BTSnoop helpers not available (tools/btsnoop_to_jsonl.py).", fg=typer.colors.RED)
         raise typer.Exit(code=2)
+
 
 # ── parse ───────────────────────────────────────────────────────
 
@@ -80,7 +76,6 @@ def wireshark_parse(
     try:
         with infile.open("r", encoding="utf-8") as f:
             rows = parse_wireshark_stream(f, handle=handle, op=op, rx=rx)  # type: ignore
-           
             if str(outfile) == "-":
                 import sys as _sys
                 write_jsonl(rows, _sys.stdout, pretty=pretty)  # type: ignore
@@ -90,6 +85,7 @@ def wireshark_parse(
                     write_jsonl(rows, out, pretty=pretty)  # type: ignore
     except Exception as e:
         raise typer.BadParameter(f"Parse failed: {e}") from e
+
 
 # ── peek ────────────────────────────────────────────────────────
 
@@ -144,6 +140,7 @@ def wireshark_peek(
                 typer.secho("No matching frames.", fg=typer.colors.YELLOW)
     except Exception as e:
         raise typer.BadParameter(f"Peek failed: {e}") from e
+
 
 # ── bytes-encode / bytes-decode ─────────────────────────────────
 
@@ -226,20 +223,20 @@ def wireshark_bytes_encode(
             if (text := _decode_if_totals(params)):
                 typer.echo(text)
 
+
 @app.command(name="bytes-decode")
 def wireshark_bytes_decode_to_ctl(
     file_path: Annotated[str, typer.Argument(help="Path to a text file with 'Encode Message …' blocks or JSON lines")],
     raw: Annotated[bool, typer.Option("--raw/--no-raw", help="Also print decoded JSON rows")] = False,
 ) -> None:
     """Decode captured ‘Encode Message …’ blocks into normalized CTL lines."""
-    
     if parse_log_blob is None:
         raise typer.BadParameter("Protocol helpers not available in this environment.")
     try:
         text = Path(file_path).read_text(encoding="utf-8")
     except OSError as e:
         raise typer.BadParameter(f"Could not read file: {e}") from e
-    
+
     recs = parse_log_blob(text)
     if not recs:
         typer.echo("No records parsed.")
@@ -257,6 +254,7 @@ def wireshark_bytes_decode_to_ctl(
         raise typer.Exit(1)
     for ln in lines:
         typer.echo(ln)
+
 
 # ── raw-command ─────────────────────────────────────────────────
 
@@ -285,6 +283,7 @@ def wireshark_raw_command(
     import asyncio
     asyncio.run(run())
 
+
 # ── btsnoop-to-jsonl ───────────────────────────────────────────
 
 @app.command("btsnoop-to-jsonl")
@@ -305,7 +304,8 @@ def wireshark_btsnoop_to_jsonl(
                 write_jsonl_btsnoop(iter_btsnoop_records(infile), out, pretty=pretty)  # type: ignore
     except Exception as e:
         raise typer.BadParameter(f"btsnoop conversion failed: {e}") from e
-    
+
+
 @app.command("extract-frames")
 def wireshark_extract_frames(
     infile: Annotated[Path, typer.Argument(exists=True, readable=True, help="JSONL created by btsnoop-to-jsonl")],
@@ -321,7 +321,6 @@ def wireshark_extract_frames(
     import json
 
     def _xor_checksum(buf: bytes) -> int:
-        # same as protocol.py: XOR from index 1..end
         c = buf[1]
         for b in buf[2:]:
             c ^= b
@@ -330,29 +329,24 @@ def wireshark_extract_frames(
     def _find_frames(payload: bytes) -> list[bytes]:
         out: list[bytes] = []
         n = len(payload)
-        # try every starting position; frames are typically short (< 64), but we allow up to ~128
         for i in range(n):
             first = payload[i]
             if first not in (0xA5, 0x5B):
                 continue
-            # minimal frame len is 8 (cmd,01,len,hi,lo,mode,p0,chk)
             for L in range(8, min(128, n - i) + 1):
                 s = payload[i:i + L]
                 if len(s) < 8:
                     continue
-                # basic structure: s[1] should be 0x01, checksum must match
                 if s[1] != 0x01:
                     continue
                 if _xor_checksum(s[:-1]) != s[-1]:
                     continue
-                # length field sanity: s[2] = params_len + (fixed fields after len)
-                # For our A5/5B encoders len = len(params)+5 and total frame is 3 + (len)+1
                 params_len = s[2] - 5
                 expected_total = 3 + s[2] + 1
                 if params_len < 0 or expected_total != len(s):
                     continue
                 out.append(bytes(s))
-                break  # don’t report overlapping larger slices starting at same i
+                break
         return out
 
     def _frame_to_jsonline(frm: bytes) -> str | None:
@@ -363,7 +357,6 @@ def wireshark_extract_frames(
         params = list(int(x) for x in frm[6:-1])
         return json.dumps({"cmd": int(cmd), "mode": int(mode), "params": params}, ensure_ascii=False)
 
-    # read JSONL
     frames_jsonl: list[str] = []
     frames_hex: list[str] = []
     with infile.open("r", encoding="utf-8") as f:
@@ -392,7 +385,6 @@ def wireshark_extract_frames(
         typer.secho("No A5/5B frames found.", fg=typer.colors.YELLOW)
         raise typer.Exit(2)
 
-    # write outputs
     if str(outfile) == "-":
         import sys
         for j in frames_jsonl:
@@ -401,9 +393,7 @@ def wireshark_extract_frames(
         outfile.parent.mkdir(parents=True, exist_ok=True)
         outfile.write_text("\n".join(frames_jsonl) + "\n", encoding="utf-8")
 
-    if also_hex:
-        hex_path = outfile.with_suffix(".hex") if str(outfile) != "-" else None
-        if hex_path:
-            hex_path.write_text("\n".join(frames_hex) + "\n", encoding="utf-8")
+    if also_hex and str(outfile) != "-":
+        outfile.with_suffix(".hex").write_text("\n".join(frames_hex) + "\n", encoding="utf-8")
 
-    typer.secho(f"Extracted {len(frames_jsonl)} frame(s).", fg=typer.colors.GREEN)    
+    typer.secho(f"Extracted {len(frames_jsonl)} frame(s).", fg=typer.colors.GREEN)

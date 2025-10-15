@@ -169,9 +169,3 @@ async def async_get_options_flow(config_entry: "ConfigEntry"):
     # Lazy import avoids circular/import-order issues
     from .config_flow import ChihirosOptionsFlow
     return ChihirosOptionsFlow(config_entry)
-
-# ────────────────────────────────────────────────────────────────
-# Optional: re-export the wireshark subpackage for nicer imports:
-#   from custom_components.chihiros import wireshark
-# ────────────────────────────────────────────────────────────────
-from . import wireshark as wireshark  # noqa: F401
