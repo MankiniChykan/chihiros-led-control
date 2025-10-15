@@ -120,7 +120,7 @@ async def async_setup_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> bool
 
     # Choose platforms per device type
     platforms_to_load: list[Platform] = (
-        [Platform.BUTTON, Platform.NUMBER] if is_doser else [Platform.LIGHT, Platform.SWITCH]
+        [Platform.BUTTON, Platform.NUMBER] if is_doser else [Platform.LIGHT, Platform.SWITCH, Platform.SENSOR]
     )
 
     _LOGGER.debug(
@@ -151,7 +151,7 @@ async def async_unload_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> boo
     if data and getattr(data.coordinator, "device_type", "led") == "doser":
         platforms_to_unload = [Platform.BUTTON, Platform.NUMBER]
     else:
-        platforms_to_unload = [Platform.LIGHT, Platform.SWITCH]
+        platforms_to_unload = [Platform.LIGHT, Platform.SWITCH, Platform.SENSOR]
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms_to_unload)
     if unload_ok:
