@@ -1,4 +1,3 @@
-# custom_components/chihiros/sensor.py
 """
 Chihiros Doser — Daily Totals sensors (LED 0x5B probe, tolerant decode).
 
@@ -9,15 +8,12 @@ returning mL values as decoded by protocol.parse_totals_frame().
 How it works (aligned with protocol.py):
 • On each scheduled refresh, we connect over BLE (via HA's connector),
   subscribe to UART_TX notifications, and send a tiny set of LED-side probes
-  built by protocol.build_totals_probes() (currently 0x34 then 0x22).
+  built by protocol.build_totals_probes() (currently 0x1E then 0x22).
 • The first notify that protocol.parse_totals_frame(...) can decode into four
   channel values wins; we cache and expose it via DataUpdateCoordinator.
 • The coordinator also accepts “push” updates via the dispatcher signal
   f"{DOMAIN}_push_totals_{address}", for cases where you already listen to
   notifications elsewhere and want to feed decoded results directly.
-
-Anything that does not match the device’s behavior (per your captures) has been
-intentionally left out.
 """
 
 from __future__ import annotations
@@ -117,26 +113,23 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._lock = asyncio.Lock()  # avoid overlapping BLE connects
 
     async def _async_update_data(self) -> dict[str, Any]:
-        # Guard (shouldn’t be hit because setup exits when disabled)
         if DISABLE_DOSER_TOTAL_SENSORS:
             _LOGGER.debug("sensor: coordinator update skipped (disabled)")
             return self._last
 
-        # Lazy-import runtime-only deps so the module can be imported without them
         from bleak_retry_connector import (
             BleakClientWithServiceCache,
             BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC,
             establish_connection,
         )
-        from .chihiros_doser_control.protocol import UART_TX, UART_RX  # notify/write UUIDs
-        from .chihiros_doser_control import protocol as dp             # to build probes & parse
+        from .chihiros_doser_control.protocol import UART_TX, UART_RX
+        from .chihiros_doser_control import protocol as dp
 
         async with self._lock:
             if not self.address:
                 _LOGGER.debug("sensor: no BLE address; keeping last values")
                 return self._last
 
-            # IMPORTANT: HA stores addresses uppercase
             ble_dev = bluetooth.async_ble_device_from_address(self.hass, self.address.upper(), True)
             if not ble_dev:
                 _LOGGER.debug("sensor: no BLEDevice for %s; keeping last", self.address)
@@ -157,7 +150,6 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             client = None
             try:
-                # Use HA-friendly connector; it queues if a slot isn’t available
                 client = await establish_connection(
                     BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-totals"
                 )
@@ -169,10 +161,10 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except Exception:
                     frames = []
 
-                # Fallback: try a couple of LED-style modes if helper not available
+                # Fallback: align with service behaviour (0x1E then 0x22)
                 if not frames:
                     try:
-                        frames.extend([dp.encode_5b(0x34, []), dp.encode_5b(0x22, [])])
+                        frames.extend([dp.encode_5b(0x1E, []), dp.encode_5b(0x22, [])])
                     except Exception:
                         pass
 
@@ -185,7 +177,7 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             await client.write_gatt_char(UART_TX, frame, response=True)
                         except Exception:
                             _LOGGER.debug("sensor: probe write failed (idx=%d)", idx, exc_info=True)
-                    await asyncio.sleep(0.08)  # keep under SCAN_TIMEOUT budget
+                    await asyncio.sleep(0.08)
 
                 try:
                     res = await asyncio.wait_for(got, timeout=SCAN_TIMEOUT)
