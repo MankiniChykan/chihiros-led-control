@@ -1,3 +1,4 @@
+# custom_components/chihiros/config_flow.py
 """Config flow for chihiros integration."""
 
 from __future__ import annotations
@@ -10,51 +11,61 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow, ConfigEntry
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.helpers import config_validation as cv
 
-from .chihiros_led_control.device import BaseDevice, get_model_class_from_name
-from .chihiros_led_control.device.commander1 import Commander1
-from .chihiros_led_control.device.commander4 import Commander4
-from .chihiros_led_control.device.fallback import Fallback
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-ADDITIONAL_DISCOVERY_TIMEOUT = 60
+
+def _is_doser_name(name: str | None) -> bool:
+    if not name:
+        return False
+    n = name.lower()
+    return n.startswith("dydose") or "dose" in n  # seen: DYDOSE..., DYDOSEDF..., etc.
 
 
 class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for chihiros."""
-
     VERSION = 1
 
     def __init__(self) -> None:
-        """Initialize the config flow."""
         self._discovery_info: BluetoothServiceInfoBleak | None = None
-        self._discovered_device: BaseDevice | None = None
+        self._discovered_device: Any | None = None
         self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
 
+    # ---------- Bluetooth auto-discovery ----------
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
     ) -> ConfigFlowResult:
-        """Handle the bluetooth discovery step."""
         await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
+
+        # Route by advert name first (no heavy imports yet)
+        if _is_doser_name(discovery_info.name):
+            _LOGGER.debug("BLE discovered Chihiros DOSER: %s", discovery_info.name)
+            self._discovery_info = discovery_info
+            return await self.async_step_doser_confirm()
+
+        # Lazy-import LED stack only when needed
+        from .chihiros_led_control.device import get_model_class_from_name
+        from .chihiros_led_control.device.commander1 import Commander1
+        from .chihiros_led_control.device.commander4 import Commander4
+        from .chihiros_led_control.device.fallback import Fallback
+
         model_class = get_model_class_from_name(discovery_info.name)
         device = model_class(discovery_info.device)
         self._discovery_info = discovery_info
         self._discovered_device = device
-        _LOGGER.debug(
-            "async_step_bluetooth - discovered device %s", discovery_info.name
-        )
-        # If we don't know the exact device model (fallback), ask for extra info
-        model_class = get_model_class_from_name(discovery_info.name)
+
         if model_class in (Fallback, Commander1, Commander4):
-            # Fallback detected - move to fallback config step
-            self._discovery_info = discovery_info
-            self._discovered_device = model_class(discovery_info.device)
             return await self.async_step_fallback_config()
 
         return await self.async_step_bluetooth_confirm()
@@ -62,146 +73,111 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_bluetooth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Confirm discovery."""
-        assert self._discovered_device is not None
-        device = self._discovered_device
         assert self._discovery_info is not None
-        discovery_info = self._discovery_info
-        title = device.name or discovery_info.name
+        title = getattr(self._discovered_device, "name", None) or self._discovery_info.name or "Chihiros LED"
         if user_input is not None:
-            return self.async_create_entry(title=title, data={CONF_ADDRESS: discovery_info.address})  # type: ignore
-
+            return self.async_create_entry(title=title, data={CONF_ADDRESS: self._discovery_info.address})
         self._set_confirm_only()
-        placeholders = {"name": title}
-        self.context["title_placeholders"] = placeholders
-        return self.async_show_form(  # type: ignore
-            step_id="bluetooth_confirm", description_placeholders=placeholders
-        )
+        return self.async_show_form(step_id="bluetooth_confirm", description_placeholders={"name": title})
 
     async def async_step_fallback_config(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Ask user for device details when fallback device is detected."""
-        assert self._discovered_device is not None
         assert self._discovery_info is not None
-        discovery_info = self._discovery_info
+        default_name = getattr(self._discovered_device, "name", None) or self._discovery_info.name or "Chihiros LED"
 
-        errors: dict[str, str] = {}
         if user_input is not None:
-            # Create config entry including the address, chosen name and device type
-            title = (
-                user_input.get(CONF_NAME)
-                or self._discovered_device.name
-                or discovery_info.name
-            )
+            title = user_input.get(CONF_NAME, default_name)
             data = {
-                CONF_ADDRESS: discovery_info.address,
-                CONF_NAME: user_input.get(CONF_NAME, title),
-                "device_type": user_input["device_type"],
+                CONF_ADDRESS: self._discovery_info.address,
+                CONF_NAME: title,
+                "device_type": user_input["device_type"],  # white|rgb|wrgb (used in __init__.py)
             }
-            return self.async_create_entry(title=title, data=data)  # type: ignore
+            return self.async_create_entry(title=title, data=data)
 
-        # Default name to discovered name
-        default_name = self._discovered_device.name or discovery_info.name
-        data_schema = vol.Schema(
+        schema = vol.Schema(
             {
                 vol.Required(CONF_NAME, default=default_name): str,
-                vol.Required("device_type", default="white"): vol.In(
-                    ["white", "rgb", "wrgb"]
-                ),
+                vol.Required("device_type", default="white"): vol.In(["white", "rgb", "wrgb"]),
             }
         )
-        return self.async_show_form(
-            step_id="fallback_config", data_schema=data_schema, errors=errors
-        )
+        return self.async_show_form(step_id="fallback_config", data_schema=schema, errors={})
 
+    # ---------- Doser path ----------
+    async def async_step_doser_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        assert self._discovery_info is not None
+        title = self._discovery_info.name or "Chihiros Doser"
+        if user_input is not None:
+            # Store only the BLE address; __init__.py will classify by name.
+            return self.async_create_entry(title=title, data={CONF_ADDRESS: self._discovery_info.address})
+        self._set_confirm_only()
+        return self.async_show_form(step_id="doser_confirm", description_placeholders={"name": title})
+
+    # ---------- Manual user-initiated path ----------
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Handle the user step to pick discovered device."""
-        errors: dict[str, str] = {}
-
         if user_input is not None:
             address = user_input[CONF_ADDRESS]
-            discovery_info = self._discovered_devices[address]
-            await self.async_set_unique_id(
-                discovery_info.address, raise_on_progress=False
-            )
+            si = self._discovered_devices[address]
+            await self.async_set_unique_id(si.address, raise_on_progress=False)
             self._abort_if_unique_id_configured()
-            model_class = get_model_class_from_name(discovery_info.name)
-            device = model_class(discovery_info.device)
 
-            self._discovery_info = discovery_info
-            self._discovered_device = device
-            model_class = get_model_class_from_name(discovery_info.name)
-            # If fallback detected, ask for device details
+            if _is_doser_name(si.name):
+                self._discovery_info = si
+                return await self.async_step_doser_confirm()
+
+            from .chihiros_led_control.device import get_model_class_from_name
+            from .chihiros_led_control.device.commander1 import Commander1
+            from .chihiros_led_control.device.commander4 import Commander4
+            from .chihiros_led_control.device.fallback import Fallback
+
+            model_class = get_model_class_from_name(si.name)
+            self._discovery_info = si
+            self._discovered_device = model_class(si.device)
+
             if model_class in (Fallback, Commander1, Commander4):
                 return await self.async_step_fallback_config()
 
-            title = device.name or discovery_info.name
-            return self.async_create_entry(  # type: ignore
-                title=title, data={CONF_ADDRESS: discovery_info.address}
-            )
+            title = getattr(self._discovered_device, "name", None) or si.name or "Chihiros LED"
+            return self.async_create_entry(title=title, data={CONF_ADDRESS: si.address})
 
-        if discovery := self._discovery_info:
-            self._discovered_devices[discovery.address] = discovery
+        # build list
+        if self._discovery_info:
+            self._discovered_devices[self._discovery_info.address] = self._discovery_info
         else:
-            current_addresses = self._async_current_ids()
-            for discovery in async_discovered_service_info(self.hass):
-                if (
-                    discovery is not None
-                    and discovery.address not in current_addresses
-                    and discovery.address not in self._discovered_devices
-                ):
-                    self._discovered_devices[discovery.address] = discovery
+            current = self._async_current_ids()
+            for d in async_discovered_service_info(self.hass):
+                if d and d.address not in current and d.address not in self._discovered_devices:
+                    self._discovered_devices[d.address] = d
 
         if not self._discovered_devices:
-            return self.async_abort(reason="no_devices_found")  # type: ignore
+            return self.async_abort(reason="no_devices_found")
 
-        data_schema = vol.Schema(
+        schema = vol.Schema(
             {
                 vol.Required(CONF_ADDRESS): vol.In(
-                    {
-                        service_info.address: (
-                            f"{service_info.name} ({service_info.address})"
-                        )
-                        for service_info in self._discovered_devices.values()
-                    }
-                ),
+                    {si.address: f"{si.name} ({si.address})" for si in self._discovered_devices.values()}
+                )
             }
         )
-        return self.async_show_form(  # type: ignore
-            step_id="user", data_schema=data_schema, errors=errors
-        )
-    
-# -------------------------
-# Options Flow: select channels
-# -------------------------
+        return self.async_show_form(step_id="user", data_schema=schema, errors={})
+
+
 class ChihirosOptionsFlow(OptionsFlow):
     """Options flow to select which doser channels are enabled."""
-
     def __init__(self, entry: ConfigEntry) -> None:
         self._entry = entry
 
     async def async_step_init(self, user_input: dict | None = None):
         if user_input is not None:
-            # cv.multi_select returns string keys; sanitize → sorted list of ints 1..4
             raw = user_input.get("enabled_channels", [])
-            enabled = sorted({int(x) for x in raw if str(x) in {"1", "2", "3", "4"}})
-            if not enabled:
-                enabled = [1]  # ensure at least one channel enabled
-            return self.async_create_entry(
-                title="",
-                data={
-                    "enabled_channels": enabled,     # store as ints
-                    "channel_count": len(enabled),   # convenience for code/UI
-                },
-            )
+            enabled = sorted({int(x) for x in raw if str(x) in {"1", "2", "3", "4"}}) or [1]
+            return self.async_create_entry(title="", data={"enabled_channels": enabled, "channel_count": len(enabled)})
 
-        # Default selection: previously chosen, else all 4
-        current = self._entry.options.get("enabled_channels")
-        if not current:
-            current = [1, 2, 3, 4]
+        current = self._entry.options.get("enabled_channels") or [1, 2, 3, 4]
         default = [str(x) for x in current]
         schema = vol.Schema(
             {
