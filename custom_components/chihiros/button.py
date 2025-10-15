@@ -1,11 +1,32 @@
+# custom_components/chihiros/button.py
+"""
+Chihiros Doser — “Dose Now” buttons
+
+Purpose:
+- Per-channel button that triggers the integration's `dose_ml` service.
+- After sending the dose, it nudges the daily-totals sensors to refresh by
+  dispatching the same signals `sensor.py` subscribes to.
+
+Matches current behavior in:
+- protocol.py (dose is 1-based in the service layer, converted on-wire internally)
+- sensor.py (listens to both per-entry and per-address refresh signals)
+
+Nothing else is added to avoid diverging from device-confirmed behavior.
+"""
+
 from __future__ import annotations
 
-import asyncio  # NEW: brief pause before triggering sensor refresh
+import asyncio
+from typing import Any, Optional
+
 from homeassistant.components.button import ButtonEntity
 from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.dispatcher import async_dispatcher_send  # NEW: notify sensors to refresh
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import DOMAIN
+
+# Small, post-dose dwell so the device updates its internal totals
+_REFRESH_DELAY_S = 0.30
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -21,14 +42,13 @@ async def async_setup_entry(hass, entry, async_add_entities):
     if not channels:
         count = int(getattr(coord, "channel_count", 4))
         channels = list(range(1, count + 1))
+
     entities = [DoserDoseNowButton(hass, entry, coord, ch) for ch in channels]
     async_add_entities(entities)
 
 
 class DoserDoseNowButton(ButtonEntity):
-    """Per-channel 'Dose now' button that calls the chihiros.dose_ml service
-    and then requests an immediate totals refresh from the sensor platform.
-    """
+    """Per-channel 'Dose now' button."""
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:play-circle"
@@ -40,8 +60,7 @@ class DoserDoseNowButton(ButtonEntity):
         self._ch = ch
 
         self._attr_name = f"Ch {ch} Dose Now"
-        self._attr_unique_id = f"{coord.address}-ch{ch}-dose-now"
-        # Separate device tile for the doser (distinct from the LED device tile)
+        self._attr_unique_id = f"{getattr(coord, 'address', 'unknown')}-ch{ch}-dose-now"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._entry.entry_id)},
             manufacturer="Chihiros",
@@ -50,24 +69,20 @@ class DoserDoseNowButton(ButtonEntity):
         )
 
     async def async_press(self) -> None:
-        amount = getattr(self._coord, "doser_amounts", {}).get(self._ch, 1.0)
+        # Amount map is expected to be {1: ml, 2: ml, ...}; default 1.0 mL if missing
+        amount = float(getattr(self._coord, "doser_amounts", {}).get(self._ch, 1.0))
+        address = getattr(self._coord, "address", None)
 
-        # Send the dose via the integration's service
+        # Send the dose via the integration's service (channel is 1-based)
         await self._hass.services.async_call(
             DOMAIN,
             "dose_ml",
-            {"address": self._coord.address, "channel": self._ch, "ml": float(amount)},
+            {"address": address, "channel": self._ch, "ml": amount},
             blocking=True,
         )
 
-        # NEW: Give the firmware a brief moment to update its internal totals,
-        # then ask the sensor coordinator to refresh immediately via dispatcher.
-        # The matching listener is set up in sensor.py and will call
-        # coordinator.async_request_refresh() when it receives this signal.
-        await asyncio.sleep(0.3)
+        # Give the device a beat to update its internal counters, then refresh sensors
+        await asyncio.sleep(_REFRESH_DELAY_S)
         async_dispatcher_send(self._hass, f"{DOMAIN}_{self._entry.entry_id}_refresh_totals")
-
-        # NEW: also send a per-address refresh signal (sensor.py subscribes to this too)
-        addr = getattr(self._coord, "address", None)
-        if addr:
-            async_dispatcher_send(self._hass, f"{DOMAIN}_refresh_totals_{addr.lower()}")
+        if address:
+            async_dispatcher_send(self._hass, f"{DOMAIN}_refresh_totals_{address.lower()}")

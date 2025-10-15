@@ -1,4 +1,25 @@
 # custom_components/chihiros/sensor.py
+"""
+Chihiros Doser — Daily Totals sensors (LED 0x5B probe, tolerant decode).
+
+This sensor platform passively listens for the device's daily totals frame
+(LED/report side, CMD=0x5B) and exposes four sensors — one per channel —
+returning mL values as decoded by protocol.parse_totals_frame().
+
+How it works (aligned with protocol.py):
+• On each scheduled refresh, we connect over BLE (via HA's connector),
+  subscribe to UART_TX notifications, and send a tiny set of LED-side probes
+  built by protocol.build_totals_probes() (currently 0x34 then 0x22).
+• The first notify that protocol.parse_totals_frame(...) can decode into four
+  channel values wins; we cache and expose it via DataUpdateCoordinator.
+• The coordinator also accepts “push” updates via the dispatcher signal
+  f"{DOMAIN}_push_totals_{address}", for cases where you already listen to
+  notifications elsewhere and want to feed decoded results directly.
+
+Anything that does not match the device’s behavior (per your captures) has been
+intentionally left out.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,7 +35,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, CoordinatorEntity
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-# Enable totals sensors
+# Enable/disable totals sensors if you need to troubleshoot
 DISABLE_DOSER_TOTAL_SENSORS: bool = False
 
 # Keep type hints without importing heavy deps at module import time
@@ -24,14 +45,14 @@ if TYPE_CHECKING:
         BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC,
         establish_connection,
     )
-    from .chihiros_doser_control.protocol import UART_TX  # notify UUID
-    from .chihiros_doser_control import protocol as dp    # helpers
+    from .chihiros_doser_control.protocol import UART_TX, UART_RX  # UUIDs
+    from .chihiros_doser_control import protocol as dp            # helpers
 
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_TIMEOUT = 8.0            # seconds to wait for one totals notify
+SCAN_TIMEOUT = 8.0             # seconds to wait for one totals notify
 UPDATE_EVERY = timedelta(minutes=15)
 
 
@@ -41,7 +62,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         _LOGGER.info("chihiros.sensor: totals sensors DISABLED; skipping setup for %s", entry.entry_id)
         return
 
-    # Get BLE address from your integration's stored coordinator (unchanged)
+    # Pull the BLE address from whatever object your integration stores
     data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     address: Optional[str] = getattr(getattr(data, "coordinator", None), "address", None)
     _LOGGER.debug("chihiros.sensor: setup entry=%s addr=%s", entry.entry_id, address)
@@ -86,7 +107,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
 
 class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Listen briefly for the 0x91 totals notify and decode centi-mL pairs."""
+    """Listen briefly for the 0x5B totals notify and decode ml pairs."""
 
     def __init__(self, hass: HomeAssistant, address: Optional[str], entry: ConfigEntry):
         super().__init__(hass, logger=_LOGGER, name=f"{DOMAIN}-doser-totals", update_interval=UPDATE_EVERY)
@@ -107,8 +128,8 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC,
             establish_connection,
         )
-        from .chihiros_doser_control.protocol import UART_TX  # notify UUID
-        from .chihiros_doser_control import protocol as dp    # to build query/probes & parse
+        from .chihiros_doser_control.protocol import UART_TX, UART_RX  # notify/write UUIDs
+        from .chihiros_doser_control import protocol as dp             # to build probes & parse
 
         async with self._lock:
             if not self.address:
@@ -121,23 +142,16 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("sensor: no BLEDevice for %s; keeping last", self.address)
                 return self._last
 
-            fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+            got: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
 
             def _cb(_char, payload: bytearray):
-                """Notify callback — STRICT 0x91 totals only."""
+                """Notify callback — STRICT LED totals (0x5B) only."""
                 try:
                     if not payload:
                         return
-                    values: Optional[list[float]] = None
-                    try:
-                        # Expect 0x91 cmd with mode 0x34 (or 0x22), four 16-bit BE pairs
-                        values = dp.parse_totals_frame(payload)
-                    except Exception:
-                        values = None
-
-                    if values is not None and not fut.done():
-                        fut.set_result({"ml": values, "raw": bytes(payload)})
-
+                    values = dp.parse_totals_frame(payload)
+                    if values is not None and not got.done():
+                        got.set_result({"ml": values[:4], "raw": bytes(payload)})
                 except Exception:
                     _LOGGER.exception("sensor: notify parse error")
 
@@ -149,31 +163,32 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 await client.start_notify(UART_TX, _cb)
 
-                # Try a small set of probes to nudge devices if they need a request
-                frames: list[bytes] = []
+                # Build the minimal set of probes supported by the device/firmware
                 try:
-                    if hasattr(dp, "build_totals_probes"):
-                        frames = list(dp.build_totals_probes())
+                    frames: list[bytes] = list(dp.build_totals_probes())
                 except Exception:
                     frames = []
 
-                # Optional: if you want LED-only probes, make build_totals_probes LED-only in protocol.py
+                # Fallback: try a couple of LED-style modes if helper not available
                 if not frames:
                     try:
-                        frames.extend([dp.encode_5b(0x22, []), dp.encode_5b(0x1E, [])])
+                        frames.extend([dp.encode_5b(0x34, []), dp.encode_5b(0x22, [])])
                     except Exception:
                         pass
 
+                # Write probes; most devices accept on UART_RX, a few on TX (so guard)
                 for idx, frame in enumerate(frames):
                     try:
-                        await client.write_gatt_char(dp.UART_RX, frame, response=True)
-                        _LOGGER.debug("sensor: sent totals probe %d/%d (len=%d)", idx + 1, len(frames), len(frame))
+                        await client.write_gatt_char(UART_RX, frame, response=True)
                     except Exception:
-                        _LOGGER.debug("sensor: probe write failed (idx=%d)", idx, exc_info=True)
-                    await asyncio.sleep(0.08)  # small gap; keep under SCAN_TIMEOUT budget
+                        try:
+                            await client.write_gatt_char(UART_TX, frame, response=True)
+                        except Exception:
+                            _LOGGER.debug("sensor: probe write failed (idx=%d)", idx, exc_info=True)
+                    await asyncio.sleep(0.08)  # keep under SCAN_TIMEOUT budget
 
                 try:
-                    res = await asyncio.wait_for(fut, timeout=SCAN_TIMEOUT)
+                    res = await asyncio.wait_for(got, timeout=SCAN_TIMEOUT)
                     self._last = res
                 except asyncio.TimeoutError:
                     _LOGGER.debug("sensor: no totals frame within %.1fs; keeping last", SCAN_TIMEOUT)
