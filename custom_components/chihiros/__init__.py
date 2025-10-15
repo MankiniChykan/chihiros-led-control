@@ -120,8 +120,10 @@ async def async_setup_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> bool
 
     # Choose platforms per device type
     platforms_to_load: list[Platform] = (
-        [Platform.BUTTON, Platform.NUMBER] if is_doser else [Platform.LIGHT, Platform.SWITCH, Platform.SENSOR]
-    )
+        [Platform.BUTTON, Platform.NUMBER, Platform.SENSOR]  # include sensors for doser
+        if is_doser
+        else [Platform.LIGHT, Platform.SWITCH, Platform.SENSOR]
+)
 
     _LOGGER.debug(
         "Loading platforms for %s (%s): %s", entry.title, coordinator.device_type, platforms_to_load
@@ -149,7 +151,7 @@ async def async_unload_entry(hass: "HomeAssistant", entry: "ConfigEntry") -> boo
 
     data: ChihirosData | None = hass.data.get(DOMAIN, {}).get(entry.entry_id)  # type: ignore[assignment]
     if data and getattr(data.coordinator, "device_type", "led") == "doser":
-        platforms_to_unload = [Platform.BUTTON, Platform.NUMBER]
+        platforms_to_unload = [Platform.BUTTON, Platform.NUMBER, Platform.SENSOR]
     else:
         platforms_to_unload = [Platform.LIGHT, Platform.SWITCH, Platform.SENSOR]
 
