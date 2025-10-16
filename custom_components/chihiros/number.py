@@ -1,4 +1,7 @@
+# custom_components/chihiros/number.py
 from __future__ import annotations
+
+from typing import Any
 
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.helpers.entity import DeviceInfo
@@ -14,6 +17,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     if getattr(coord, "device_type", "led") != "doser":
         return
 
+    # Stash per-channel amounts on the central coordinator so buttons/services can reuse them.
     if not hasattr(coord, "doser_amounts"):
         coord.doser_amounts = {}
 
@@ -22,6 +26,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     if not channels:
         count = int(getattr(coord, "channel_count", 4))
         channels = list(range(1, count + 1))
+
     entities = [DoserDoseAmount(entry, coord, ch) for ch in channels]
     async_add_entities(entities)
 
@@ -36,15 +41,21 @@ class DoserDoseAmount(NumberEntity):
     _attr_native_step = 0.1
     _attr_mode = NumberMode.BOX
     _attr_native_unit_of_measurement = "mL"
+    _attr_should_poll = False  # purely local knob stored on the coordinator
 
     def __init__(self, entry, coord, ch: int) -> None:
         self._entry = entry
         self._coord = coord
         self._ch = ch
+
+        # Default to 1.0 mL if the channel hasn't been set yet
         self._coord.doser_amounts.setdefault(self._ch, 1.0)
 
         self._attr_name = f"Ch {ch} Dose Amount"
-        self._attr_unique_id = f"{coord.address}-ch{ch}-dose-amount"
+        # Be tolerant if address isn't set yet; it will still be a stable unique_id per entry
+        address = getattr(coord, "address", None) or "unknown"
+        self._attr_unique_id = f"{address}-ch{ch}-dose-amount"
+
         # Separate device tile for the doser (distinct from the LED device tile)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._entry.entry_id)},
@@ -60,4 +71,5 @@ class DoserDoseAmount(NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         v = max(self._attr_native_min_value, min(float(value), self._attr_native_max_value))
         self._coord.doser_amounts[self._ch] = round(v, 1)
+        # No I/O here; just update state
         self.async_write_ha_state()

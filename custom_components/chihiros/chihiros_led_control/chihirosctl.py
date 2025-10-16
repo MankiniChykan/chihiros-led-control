@@ -1,5 +1,10 @@
 # custom_components/chihiros/chihiros_led_control/chihirosctl.py
-"""Chihiros LED control CLI entrypoint."""
+"""Chihiros LED control CLI entrypoint.
+
+This CLI focuses on LED devices but can also mount the optional Doser and
+Template CLIs (when those optional deps are available). All imports are done
+defensively so Home Assistant environments are not impacted.
+"""
 
 from __future__ import annotations
 
@@ -18,8 +23,10 @@ from rich.table import Table
 from .device import get_device_from_address, get_model_class_from_name
 from .weekday_encoding import WeekdaySelect
 
-# Mount the Template Typer app under "template"
-# (robust so LED CLI still works when template deps/HA are missing)
+# ────────────────────────────────────────────────────────────────
+# Optional sub-apps (mounted if importable)
+# ────────────────────────────────────────────────────────────────
+# Template CLI
 try:
     from ..chihiros_template_control import storage_containers as sc
     from ..chihiros_template_control.chihirostemplatectl import app as template_app  # type: ignore
@@ -35,8 +42,7 @@ except Exception:
             fg=typer.colors.YELLOW,
         )
 
-# Mount the doser Typer app under "doser"
-# (robust so LED CLI still works when doser deps/HA are missing)
+# Doser CLI
 try:
     from ..chihiros_doser_control.chihirosdoserctl import app as doser_app  # type: ignore
 except Exception:
@@ -51,9 +57,7 @@ except Exception:
             fg=typer.colors.YELLOW,
         )
 
-# Mount the Wireshark Typer app under "wireshark"
-# NOTE: the heavy parsers/decoders live outside HA under /tools.
-# Import them optionally so HA environments aren’t affected.
+# Wireshark helpers (tools are outside HA tree; optional)
 try:
     from tools.wireshark.wiresharkctl import app as wireshark_app  # type: ignore
 except Exception:
@@ -67,7 +71,8 @@ except Exception:
             fg=typer.colors.YELLOW,
         )
 
-app = typer.Typer()
+# Root app and mounts
+app = typer.Typer(help="Chihiros LED control")
 app.add_typer(doser_app, name="doser", help="Chihiros doser control")
 app.add_typer(template_app, name="template", help="Chihiros template control")
 app.add_typer(wireshark_app, name="wireshark", help="Wireshark helpers (parse/peek/encode/tx)")
@@ -75,7 +80,6 @@ app.add_typer(wireshark_app, name="wireshark", help="Wireshark helpers (parse/pe
 # ────────────────────────────────────────────────────────────────
 # Shared runner for device-bound methods
 # ────────────────────────────────────────────────────────────────
-
 def _run_device_func(device_address: str, method_override: Optional[str] = None, **kwargs: Any):
     """
     Invoke a coroutine method on the device.
@@ -97,11 +101,10 @@ def _run_device_func(device_address: str, method_override: Optional[str] = None,
 # ────────────────────────────────────────────────────────────────
 # LED device commands
 # ────────────────────────────────────────────────────────────────
-
 @app.command(name="list-devices")
 def list_devices(timeout: Annotated[int, typer.Option()] = 5) -> None:
     """List all bluetooth devices."""
-    print("the search for Bluetooth devices is running")
+    print("Scanning for Bluetooth devices…")
     table = Table("Name", "Address", "Model")
     discovered_devices = asyncio.run(BleakScanner.discover(timeout=timeout))
     chd: list[list[str]] = []
@@ -114,7 +117,7 @@ def list_devices(timeout: Annotated[int, typer.Option()] = 5) -> None:
             if model_name not in ("???", "fallback"):
                 chd.insert(idx, [device.address, str(model_name), str(name)])
         table.add_row(name or "(unknown)", device.address, model_name)
-    print("Discovered the following devices:")
+    print("Discovered devices:")
     print(table)
     if sc is not None:
         try:
@@ -129,7 +132,7 @@ def ctl_set_turn_on(device_address: str) -> None:
     print(f"Connect to device {device_address} and turn on")
     _run_device_func(device_address, method_override="get_turn_on")
 
-# turn-off → BaseDevice.get_turn_off (fix name)
+# turn-off → BaseDevice.get_turn_off
 @app.command(name="turn-off")
 def ctl_set_turn_off(device_address: str) -> None:
     """Turn off a light."""
@@ -145,7 +148,7 @@ def set_color_brightness(
     """Set color brightness of a light."""
     _run_device_func(
         device_address,
-        method_override="async_set_color_brightness",  # fix name
+        method_override="async_set_color_brightness",
         color=color,
         brightness=brightness,
     )
@@ -156,10 +159,10 @@ def set_brightness(
     brightness: Annotated[int, typer.Argument(min=0, max=140)],
 ) -> None:
     """Set overall brightness of a light."""
-    print("Connect to device ....")
+    print("Connect to device …")
     _run_device_func(
         device_address,
-        method_override="async_set_brightness",  # use new method
+        method_override="async_set_brightness",
         brightness=brightness,
     )
 
@@ -191,7 +194,7 @@ def ctl_set_add_setting(
     weekdays: Annotated[list[WeekdaySelect], typer.Option()] = [WeekdaySelect.everyday],
 ) -> None:
     """Add setting to a light."""
-    print("Connect to device ....")
+    print("Connect to device …")
     _run_device_func(
         device_address,
         method_override="get_add_setting",
@@ -213,7 +216,7 @@ def ctl_set_add_rgb_setting(
     weekdays: Annotated[list[WeekdaySelect], typer.Option()] = [WeekdaySelect.everyday],
 ) -> None:
     """Add setting to a RGB light."""
-    print("Connect to device ....")
+    print("Connect to device …")
     _run_device_func(
         device_address,
         method_override="get_add_rgb_setting",
@@ -224,7 +227,7 @@ def ctl_set_add_rgb_setting(
         weekdays=weekdays,
     )
 
-# delete-setting → BaseDevice.get_remove_setting (fix)
+# delete-setting → BaseDevice.get_remove_setting
 @app.command(name="delete-setting")
 def ctl_set_remove_setting(
     device_address: str,
@@ -234,10 +237,10 @@ def ctl_set_remove_setting(
     weekdays: Annotated[list[WeekdaySelect], typer.Option()] = [WeekdaySelect.everyday],
 ) -> None:
     """Remove setting from a light."""
-    print("Connect to device ....")
+    print("Connect to device …")
     _run_device_func(
         device_address,
-        method_override="get_remove_setting",  # ← was wrong before
+        method_override="get_remove_setting",
         sunrise=sunrise,
         sunset=sunset,
         ramp_up_in_minutes=ramp_up_in_minutes,
@@ -248,7 +251,7 @@ def ctl_set_remove_setting(
 @app.command(name="reset-settings")
 def ctl_set_reset_settings(device_address: str) -> None:
     """Reset settings from a light."""
-    print("Connect to device ....")
+    print("Connect to device …")
     _run_device_func(device_address, method_override="get_reset_settings")
 
 # enable-auto-mode → BaseDevice.get_enable_auto_mode

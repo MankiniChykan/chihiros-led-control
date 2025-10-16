@@ -1,13 +1,17 @@
 # custom_components/chihiros/chihiros_led_control/device/__init__.py
-"""Module defining Chihiros devices."""
+"""Model registry and helpers for Chihiros devices.
+
+- Keeps imports light at module import time (no bleak / HA deps).
+- Builds a CODE -> Class registry lazily, including optional doser model if present.
+- Provides helpers to pick a device class from an advertised BLE name, or to
+  instantiate from a MAC address when running outside HA.
+"""
 from __future__ import annotations
 
 import inspect
-import sys
 from typing import Dict, Type
 
-# Light import: base class only (no bleak here)
-from .base_device import BaseDevice
+from .base_device import BaseDevice  # base class only (no bleak import here)
 
 # Lazy-built registry of MODEL_CODE -> class
 _CODE2MODEL: Dict[str, Type[BaseDevice]] | None = None
@@ -48,7 +52,7 @@ def _ensure_registry() -> Dict[str, Type[BaseDevice]]:
         __name__ + ".wrgb2_pro",
         __name__ + ".wrgb2_slim",
         __name__ + ".z_light_tiny",
-        # Optional doser model; skip if the doser package isn't present
+        # Optional: doser model (present only if the doser package is installed)
         f"{root}.chihiros_doser_control.device.doser",
     ]
 
@@ -57,7 +61,7 @@ def _ensure_registry() -> Dict[str, Type[BaseDevice]]:
         mod = _safe_import(mod_path)
         if not mod:
             continue
-        for name, obj in inspect.getmembers(mod):
+        for _name, obj in inspect.getmembers(mod):
             if inspect.isclass(obj) and issubclass(obj, BaseDevice):
                 codes = getattr(obj, "_model_codes", [])
                 if not isinstance(codes, (list, tuple)):
@@ -76,7 +80,7 @@ def get_model_class_from_name(device_name: str) -> Type[BaseDevice]:
     Matches by prefix so names like 'DYDOSED203E0FEFCBC' resolve with codes
     ['DYDOSED2', 'DYDOSED', 'DYDOSE'].
     """
-    from .fallback import Fallback  # cheap
+    from .fallback import Fallback  # cheap and safe at import-time
 
     if not device_name:
         return Fallback
@@ -99,14 +103,21 @@ def get_model_class_from_name(device_name: str) -> Type[BaseDevice]:
 
 
 async def get_device_from_address(device_address: str) -> BaseDevice:
-    """Instantiate the correct device class from a MAC address (lazy bleak import)."""
-    from bleak import BleakScanner  # lazy
+    """Instantiate the correct device class from a MAC address (lazy bleak import).
+
+    Note: This helper is intended for CLI/testing contexts. Inside Home Assistant,
+    we resolve the BLEDevice via the HA bluetooth integration and create the device
+    class from that object in __init__.py.
+    """
+    from bleak import BleakScanner  # lazy import
 
     ble_dev = await BleakScanner.find_device_by_address(device_address)
     if ble_dev and ble_dev.name:
         model_class = get_model_class_from_name(ble_dev.name)
         return model_class(ble_dev)
-    from ..exception import DeviceNotFound  # local, lightweight
+
+    from ..exception import DeviceNotFound  # lightweight local import
+
     raise DeviceNotFound
 
 

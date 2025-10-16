@@ -1,20 +1,14 @@
 # custom_components/chihiros/sensor.py
 """
-Chihiros Doser — Daily Totals sensors (LED 0x5B probe, tolerant decode).
+Chihiros Doser — Daily Totals sensors (LED 0x5B totals via central coordinator).
 
-This sensor platform passively listens for the device's daily totals frame
-(LED/report side, CMD=0x5B) and exposes four sensors — one per channel —
-returning mL values as decoded by protocol.parse_totals_frame().
+This platform no longer opens its own BLE connections. Instead, it relies on the
+central ChihirosDataUpdateCoordinator to keep a persistent connection and push
+decoded totals (ml) via the dispatcher signal:
 
-How it works (aligned with protocol.py):
-• On each scheduled refresh, we connect over BLE (via HA's connector),
-  subscribe to UART_TX notifications, and send a tiny set of LED-side probes
-  built by protocol.build_totals_probes() (0x34, then 0x22, and 0x1E).
-• The first notify that protocol.parse_totals_frame(...) can decode into four
-  channel values wins; we cache and expose it via DataUpdateCoordinator.
-• The coordinator also accepts “push” updates via the dispatcher signal
-  f"{DOMAIN}_push_totals_{address}", for cases where you already listen to
-  notifications elsewhere and want to feed decoded results directly.
+    f"{DOMAIN}_push_totals_{address.lower()}"
+
+We keep a tiny DataUpdateCoordinator here only as a cache + bridge for sensors.
 """
 
 from __future__ import annotations
@@ -24,11 +18,10 @@ import logging
 from datetime import timedelta
 from typing import Any, Optional
 
-from homeassistant.components import bluetooth
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -39,9 +32,8 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# Seconds to wait for a single totals notify (0x5B …)
-SCAN_TIMEOUT = 15.0
-# Coordinator polling cadence (you can adjust in the future)
+# Coordinator “polling” cadence — this coordinator does not do BLE I/O,
+# but we keep a periodic tick (optional) in case someone wants scheduled refresh nudges.
 UPDATE_EVERY = timedelta(minutes=15)
 
 # Enable/disable totals sensors if you need to troubleshoot
@@ -51,7 +43,7 @@ DISABLE_DOSER_TOTAL_SENSORS: bool = False
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities
 ) -> None:
-    """Set up doser daily total sensors per config entry."""
+    """Set up doser daily total sensors per config entry (push-driven)."""
     if DISABLE_DOSER_TOTAL_SENSORS:
         _LOGGER.info(
             "chihiros.sensor: totals sensors DISABLED; skipping setup for %s",
@@ -63,23 +55,25 @@ async def async_setup_entry(
     address: Optional[str] = getattr(getattr(data, "coordinator", None), "address", None)
     _LOGGER.debug("chihiros.sensor: setup entry=%s addr=%s", entry.entry_id, address)
 
-    coordinator = DoserTotalsCoordinator(hass, address, entry)
+    coordinator = DoserTotalsProxyCoordinator(hass, address, entry)
 
-    # Non-blocking initial refresh
+    # Non-blocking initial refresh (just publishes the cache)
     hass.async_create_task(coordinator.async_request_refresh())
 
-    # Per-entry refresh signal (e.g., after “Dose Now” service)
-    signal = f"{DOMAIN}_{entry.entry_id}_refresh_totals"
+    # Per-entry refresh “nudge” (e.g., after a service call)
+    # This asks whoever maintains the BLE session to try probing totals;
+    # the actual values still arrive via the push signal.
+    signal_entry_refresh = f"{DOMAIN}_{entry.entry_id}_refresh_totals"
 
     def _signal_refresh_entry() -> None:
         asyncio.run_coroutine_threadsafe(
             coordinator.async_request_refresh(), hass.loop
         )
 
-    unsub = async_dispatcher_connect(hass, signal, _signal_refresh_entry)
-    entry.async_on_unload(unsub)
+    unsub_entry = async_dispatcher_connect(hass, signal_entry_refresh, _signal_refresh_entry)
+    entry.async_on_unload(unsub_entry)
 
-    # Also allow per-address refresh signal
+    # Per-address refresh “nudge”
     if address:
         sig_addr = f"{DOMAIN}_refresh_totals_{address.lower()}"
 
@@ -88,16 +82,21 @@ async def async_setup_entry(
                 coordinator.async_request_refresh(), hass.loop
             )
 
-        unsub2 = async_dispatcher_connect(hass, sig_addr, _signal_refresh_addr)
-        entry.async_on_unload(unsub2)
+        unsub_addr = async_dispatcher_connect(hass, sig_addr, _signal_refresh_addr)
+        entry.async_on_unload(unsub_addr)
 
-    # Push path — services can decode totals and dispatch them; we adopt directly
+    # Push path — the central coordinator decodes totals and dispatches them; we adopt directly.
     if address:
         push_sig = f"{DOMAIN}_push_totals_{address.lower()}"
 
         def _on_push(data: dict[str, Any]) -> None:
             # Expect {"ml":[...], "raw": bytes/bytearray}
-            coordinator.async_set_updated_data(data)
+            coordinator.async_set_updated_data(
+                {
+                    "ml": list((data.get("ml") or [None, None, None, None]))[:4],
+                    "raw": (bytes(data.get("raw")) if isinstance(data.get("raw"), (bytes, bytearray)) else None),
+                }
+            )
 
         unsub_push = async_dispatcher_connect(hass, push_sig, _on_push)
         entry.async_on_unload(unsub_push)
@@ -106,8 +105,12 @@ async def async_setup_entry(
     async_add_entities(sensors, update_before_add=False)
 
 
-class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Listen briefly for the 0x5B totals notify and decode ml pairs."""
+class DoserTotalsProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """
+    A very light coordinator that only caches the most recent totals pushed
+    by the central BLE session. On refresh, it can optionally nudge the session
+    to probe totals (no direct BLE I/O here).
+    """
 
     def __init__(
         self, hass: HomeAssistant, address: Optional[str], entry: ConfigEntry
@@ -115,160 +118,43 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         super().__init__(
             hass,
             logger=_LOGGER,
-            name=f"{DOMAIN}-doser-totals",
-            update_interval=UPDATE_EVERY,
+            name=f"{DOMAIN}-doser-totals-proxy",
+            update_interval=UPDATE_EVERY,  # harmless; all updates are push-driven
         )
         self.address = (address or "").upper() or None
         self.entry = entry
         self._last: dict[str, Any] = {"ml": [None, None, None, None], "raw": None}
-        self._lock = asyncio.Lock()  # avoid overlapping BLE connects
+        self._lock = asyncio.Lock()
 
     async def _async_update_data(self) -> dict[str, Any]:
+        """Return the last known data; optionally ask the central session to probe."""
         if DISABLE_DOSER_TOTAL_SENSORS:
-            _LOGGER.debug("sensor: coordinator update skipped (disabled)")
+            _LOGGER.debug("sensor: proxy update skipped (disabled)")
             return self._last
 
-        # Lazy-import runtime-only deps so importing this file won’t require them
-        from bleak_retry_connector import (  # type: ignore
-            BleakClientWithServiceCache,
-            BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC,
-            establish_connection,
-        )
-        from .chihiros_doser_control.protocol import (  # type: ignore
-            UART_TX,
-            UART_RX,
-        )
-        from .chihiros_doser_control import protocol as dp  # type: ignore
-
-        async with self._lock:
-            if not self.address:
-                _LOGGER.debug("sensor: no BLE address; keeping last values")
-                return self._last
-
-            # HA stores addresses uppercase
-            ble_dev = bluetooth.async_ble_device_from_address(
-                self.hass, self.address, True
-            )
-            if not ble_dev:
-                _LOGGER.debug(
-                    "sensor: no BLEDevice for %s; keeping last", self.address
-                )
-                return self._last
-
-            got: asyncio.Future[dict[str, Any]] = (
-                asyncio.get_running_loop().create_future()
-            )
-
-            def _cb(_char, payload: bytearray) -> None:
-                """Notify callback — strict LED totals (0x5B) only."""
-                try:
-                    if not payload:
-                        return
-                    values = dp.parse_totals_frame(payload)
-                    if values is not None and not got.done():
-                        got.set_result({"ml": values[:4], "raw": bytes(payload)})
-                except Exception:  # pragma: no cover
-                    _LOGGER.exception("sensor: notify parse error")
-
-            client = None
+        # Nudge the central coordinator to probe (if it listens to this signal).
+        # This does not guarantee an immediate update; actual totals arrive via PUSH.
+        if self.address:
             try:
-                # Use HA-friendly connector; it queues if a slot isn’t available
-                client = await establish_connection(  # type: ignore
-                    BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-totals"
+                async_dispatcher_send(
+                    self.hass, f"{DOMAIN}_refresh_totals_{self.address.lower()}"
                 )
-                await client.start_notify(UART_TX, _cb)  # type: ignore
+            except Exception:
+                pass
 
-                # Build the minimal set of probes supported by the device/firmware
-                try:
-                    frames: list[bytes] = list(dp.build_totals_probes())
-                except Exception:
-                    frames = []
-
-                # Fallback: try common LED-side modes (including 0x1E seen in field logs)
-                if not frames:
-                    try:
-                        frames.extend(
-                            [
-                                dp.encode_5b(0x34, []),
-                                dp.encode_5b(0x22, []),
-                                dp.encode_5b(0x1E, []),
-                            ]
-                        )
-                    except Exception:
-                        pass
-
-                # Write probes; try RX (resp/wo-resp) then TX (resp/wo-resp)
-                for idx, frame in enumerate(frames):
-                    wrote = False
-
-                    # RX + response
-                    try:
-                        await client.write_gatt_char(UART_RX, frame, response=True)  # type: ignore
-                        wrote = True
-                    except Exception:
-                        # RX without response
-                        try:
-                            await client.write_gatt_char(UART_RX, frame, response=False)  # type: ignore
-                            wrote = True
-                        except Exception:
-                            pass
-
-                    if not wrote:
-                        # TX + response
-                        try:
-                            await client.write_gatt_char(UART_TX, frame, response=True)  # type: ignore
-                            wrote = True
-                        except Exception:
-                            # TX without response
-                            try:
-                                await client.write_gatt_char(UART_TX, frame, response=False)  # type: ignore
-                                wrote = True
-                            except Exception:
-                                pass
-
-                    if not wrote:
-                        _LOGGER.debug(
-                            "sensor: probe write failed (idx=%d)", idx, exc_info=True
-                        )
-
-                    await asyncio.sleep(0.08)  # keep under SCAN_TIMEOUT budget
-
-                try:
-                    res = await asyncio.wait_for(got, timeout=SCAN_TIMEOUT)
-                    self._last = res
-                except asyncio.TimeoutError:
-                    _LOGGER.debug(
-                        "sensor: no totals frame within %.1fs; keeping last",
-                        SCAN_TIMEOUT,
-                    )
-                finally:
-                    try:
-                        await client.stop_notify(UART_TX)  # type: ignore
-                    except Exception:
-                        pass
-            except BLEAK_EXC as e:  # type: ignore
-                _LOGGER.debug("sensor: BLE/slot error: %s; keeping last", e)
-            except Exception as e:
-                _LOGGER.warning("sensor: BLE error: %s", e)
-            finally:
-                if client:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-
-            return self._last
+        # Just return cache. The push handler will call async_set_updated_data() when values arrive.
+        return self._last
 
 
 class ChDoserDailyTotalSensor(
-    CoordinatorEntity[DoserTotalsCoordinator], SensorEntity
+    CoordinatorEntity[DoserTotalsProxyCoordinator], SensorEntity
 ):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "mL"
     _attr_has_entity_name = True
 
     def __init__(
-        self, coordinator: DoserTotalsCoordinator, entry: ConfigEntry, ch: int
+        self, coordinator: DoserTotalsProxyCoordinator, entry: ConfigEntry, ch: int
     ) -> None:
         super().__init__(coordinator)
         self._ch = ch

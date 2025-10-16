@@ -1,3 +1,4 @@
+# custom_components/chihiros/chihiros_led_control/commands.py
 """Module defining commands generation functions."""
 
 import datetime

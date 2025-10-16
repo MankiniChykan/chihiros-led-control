@@ -6,7 +6,7 @@ This module provides *wire-compatible* utilities for the A5/165 (doser) and
 5B/LED (report/totals) command families observed on the Chihiros dosing pump
 line, matching captured device behavior.
 
-Key features (all aligned to the logs/spec you provided):
+Key features (all aligned to real device behavior):
 
 • Nordic UART UUIDs:
     - We write on UART_RX and listen on UART_TX.
@@ -57,19 +57,17 @@ Key features (all aligned to the logs/spec you provided):
       the same msg_hi/msg_lo, with heartbeat “dwell” handling and one retry.
     - program_channel_weekly_with_interval() emits the proven cadence
       (mode32 → mode27 → mode22) so schedules “latch” as in the phone app.
-
-Anything outside this documented behavior was intentionally left out.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Any, Tuple, Optional, Iterable, Union, Callable
-from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
 import json
 import re
 import time
+from dataclasses import dataclass, field, asdict
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR
+from typing import List, Dict, Any, Tuple, Optional, Iterable, Union, Callable
 
 __all__ = [
     "UART_SERVICE", "UART_RX", "UART_TX",
@@ -220,7 +218,7 @@ async def dose_ml(client, channel_1based: int, ml: Union[float, int, str]) -> No
     await client.write_gatt_char(UART_RX, pkt, response=True)
 
 # ────────────────────────────────────────────────────────────────
-# NEW: builders for weekly entry & interval repeats
+# Builders for weekly entry & interval repeats
 # ────────────────────────────────────────────────────────────────
 def build_weekly_entry(channel: int, weekday_mask: int, enabled: bool, hh: int, mm: int, dose_tenths: int) -> bytes:
     """
@@ -268,7 +266,7 @@ def build_totals_query() -> bytes:
 def build_totals_probes() -> list[bytes]:
     """
     Return a small set of viable totals queries across firmwares.
-    STRICTLY LED (0x5B): try 0x34, 0x22, and 0x1E (seen in your logs).
+    STRICTLY LED (0x5B): try 0x34, 0x22, and 0x1E (seen in field logs).
     """
     frames: list[bytes] = []
     for m in (0x34, 0x22, 0x1E):
@@ -291,7 +289,7 @@ def _decode_u16_be(hi: int, lo: int) -> int:
 def parse_totals_frame(payload: bytes | bytearray) -> Optional[List[float]]:
     """
     Parse 0x5B daily totals (Mode 0x34; some fw 0x22).
-    Confirmed in device logs: pairs encode **ml×10**.
+    Confirmed in device logs: pairs encode **ml×10** (with ×100 fallback).
     """
     if not isinstance(payload, (bytes, bytearray)) or len(payload) < 16:
         return None
@@ -320,8 +318,9 @@ def parse_totals_frame(payload: bytes | bytearray) -> Optional[List[float]]:
 
     def scale_to_ml(v: int) -> float:
         ml10 = v / 10.0
-        if ml10 <= 2000.0:
+        if ml10 <= 2000.0:  # normal case
             return round(ml10, 2)
+        # fallback for some firmwares that send ×100
         return round(v / 100.0, 2)
 
     values = [scale_to_ml(v) for v in raw_pairs]
@@ -503,7 +502,6 @@ def decode_records(records: Iterable[Tuple[int,int,List[int]]]) -> List[Dict[str
 # ────────────────────────────────────────────────────────────────
 # State builder
 # ────────────────────────────────────────────────────────────────
-from dataclasses import dataclass  # (re-import kept to match original layout)
 @dataclass
 class TimerState:
     timer_type: Optional[int] = None
@@ -517,8 +515,8 @@ class ChannelState:
     amount_ml: Optional[float] = None
     weekdays_mask: Optional[int] = None
     weekdays: List[str] = field(default_factory=list)
-    time_hour: Optional[None] = None
-    time_minute: Optional[None] = None
+    time_hour: Optional[int] = None
+    time_minute: Optional[int] = None
     timer: "TimerState" = field(default_factory=TimerState)
 
     def merge(self, event: Dict[str, Any]) -> None:

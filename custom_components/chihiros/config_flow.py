@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Dict
 
 import voluptuous as vol
 from homeassistant.components.bluetooth import (
@@ -29,7 +29,8 @@ def _is_doser_name(name: str | None) -> bool:
     if not name:
         return False
     n = name.lower()
-    return n.startswith("dydose") or "dose" in n  # seen: DYDOSE..., DYDOSEDF..., etc.
+    # Seen names: DYDOSE..., DYDOSEDF..., "Chihiros Doser", etc.
+    return n.startswith("dydose") or "dose" in n
 
 
 class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -39,22 +40,24 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._discovered_device: Any | None = None
-        self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
+        self._discovered_devices: Dict[str, BluetoothServiceInfoBleak] = {}
 
     # ---------- Bluetooth auto-discovery ----------
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
     ) -> ConfigFlowResult:
-        await self.async_set_unique_id(discovery_info.address)
+        addr = (discovery_info.address or "").upper()
+        # Use raise_on_progress=False to avoid abort races when multiple flows run
+        await self.async_set_unique_id(addr, raise_on_progress=False)
         self._abort_if_unique_id_configured()
 
-        # Route by advert name first (no heavy imports yet)
+        # Route by advert name first (keep doser path import-light)
         if _is_doser_name(discovery_info.name):
             _LOGGER.debug("BLE discovered Chihiros DOSER: %s", discovery_info.name)
             self._discovery_info = discovery_info
             return await self.async_step_doser_confirm()
 
-        # Lazy-import LED stack only when needed
+        # LED stack only when not a doser
         from .chihiros_led_control.device import get_model_class_from_name
         from .chihiros_led_control.device.commander1 import Commander1
         from .chihiros_led_control.device.commander4 import Commander4
@@ -74,9 +77,12 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         assert self._discovery_info is not None
+        addr = (self._discovery_info.address or "").upper()
         title = getattr(self._discovered_device, "name", None) or self._discovery_info.name or "Chihiros LED"
+
         if user_input is not None:
-            return self.async_create_entry(title=title, data={CONF_ADDRESS: self._discovery_info.address})
+            return self.async_create_entry(title=title, data={CONF_ADDRESS: addr})
+
         self._set_confirm_only()
         return self.async_show_form(step_id="bluetooth_confirm", description_placeholders={"name": title})
 
@@ -84,14 +90,16 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         assert self._discovery_info is not None
+        addr = (self._discovery_info.address or "").upper()
         default_name = getattr(self._discovered_device, "name", None) or self._discovery_info.name or "Chihiros LED"
 
         if user_input is not None:
             title = user_input.get(CONF_NAME, default_name)
             data = {
-                CONF_ADDRESS: self._discovery_info.address,
+                CONF_ADDRESS: addr,
                 CONF_NAME: title,
-                "device_type": user_input["device_type"],  # white|rgb|wrgb (used in __init__.py)
+                # white|rgb|wrgb (used in __init__.py to pick Generic* model)
+                "device_type": user_input["device_type"],
             }
             return self.async_create_entry(title=title, data=data)
 
@@ -108,10 +116,13 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         assert self._discovery_info is not None
+        addr = (self._discovery_info.address or "").upper()
         title = self._discovery_info.name or "Chihiros Doser"
+
         if user_input is not None:
-            # Store only the BLE address; __init__.py will classify by name.
-            return self.async_create_entry(title=title, data={CONF_ADDRESS: self._discovery_info.address})
+            # Store only the BLE address; __init__.py classifies and starts the pinned session.
+            return self.async_create_entry(title=title, data={CONF_ADDRESS: addr})
+
         self._set_confirm_only()
         return self.async_show_form(step_id="doser_confirm", description_placeholders={"name": title})
 
@@ -119,10 +130,26 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
+        # Build list of discoverables (minus already-configured)
+        if self._discovery_info:
+            self._discovered_devices[self._discovery_info.address] = self._discovery_info
+        else:
+            current_ids = self._async_current_ids()
+            for d in async_discovered_service_info(self.hass):
+                if not d:
+                    continue
+                if d.address in current_ids or d.address in self._discovered_devices:
+                    continue
+                self._discovered_devices[d.address] = d
+
         if user_input is not None:
-            address = user_input[CONF_ADDRESS]
-            si = self._discovered_devices[address]
-            await self.async_set_unique_id(si.address, raise_on_progress=False)
+            sel_addr = user_input[CONF_ADDRESS]
+            si = self._discovered_devices.get(sel_addr)
+            if not si:
+                return self.async_abort(reason="no_devices_found")
+
+            addr_up = (si.address or "").upper()
+            await self.async_set_unique_id(addr_up, raise_on_progress=False)
             self._abort_if_unique_id_configured()
 
             if _is_doser_name(si.name):
@@ -141,17 +168,8 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
             if model_class in (Fallback, Commander1, Commander4):
                 return await self.async_step_fallback_config()
 
-            title = getattr(self._discovered_device, "name", None) or si.name or "Chihiros LED"
-            return self.async_create_entry(title=title, data={CONF_ADDRESS: si.address})
-
-        # build list
-        if self._discovery_info:
-            self._discovered_devices[self._discovery_info.address] = self._discovery_info
-        else:
-            current = self._async_current_ids()
-            for d in async_discovered_service_info(self.hass):
-                if d and d.address not in current and d.address not in self._discovered_devices:
-                    self._discovered_devices[d.address] = d
+            title = getattr(self._discovered_device, "name", None) || si.name | | "Chihiros LED"
+            return self.async_create_entry(title=title, data={CONF_ADDRESS: addr_up})
 
         if not self._discovered_devices:
             return self.async_abort(reason="no_devices_found")
@@ -175,7 +193,10 @@ class ChihirosOptionsFlow(OptionsFlow):
         if user_input is not None:
             raw = user_input.get("enabled_channels", [])
             enabled = sorted({int(x) for x in raw if str(x) in {"1", "2", "3", "4"}}) or [1]
-            return self.async_create_entry(title="", data={"enabled_channels": enabled, "channel_count": len(enabled)})
+            return self.async_create_entry(
+                title="",
+                data={"enabled_channels": enabled, "channel_count": len(enabled)},
+            )
 
         current = self._entry.options.get("enabled_channels") or [1, 2, 3, 4]
         default = [str(x) for x in current]

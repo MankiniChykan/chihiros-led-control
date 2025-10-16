@@ -23,8 +23,9 @@ What this file provides:
 • Probe: LED totals (0x5B 0x34 / 0x22).
 • Wireshark JSON → JSONL extractor for ATT payloads.
 
-Anything not confirmed in the captured device traffic has been purposefully
-left out to prevent drift from actual pump behaviour.
+Notes:
+- This CLI is *standalone* and does **not** depend on Home Assistant or the
+  central coordinator. It talks directly to the device using bleak.
 """
 
 from __future__ import annotations
@@ -65,6 +66,7 @@ from .protocol import (
 import json, base64
 from pathlib import Path
 
+
 # ────────────────────────────────────────────────────────────────
 # Global options
 # ────────────────────────────────────────────────────────────────
@@ -96,6 +98,7 @@ def _global_options(
         logging.getLogger("bleak").setLevel(logging.DEBUG)
         logging.getLogger("chihiros").setLevel(logging.DEBUG)
 
+
 # ────────────────────────────────────────────────────────────────
 # Helpers
 # ────────────────────────────────────────────────────────────────
@@ -108,6 +111,7 @@ def _parse_hex_blob(blob: str) -> bytes:
     except ValueError as e:
         raise typer.BadParameter("Invalid hex characters in payload.") from e
 
+
 def _int0(val: str | int) -> int:
     if isinstance(val, int):
         return val
@@ -116,12 +120,15 @@ def _int0(val: str | int) -> int:
     except ValueError as e:
         raise typer.BadParameter(f"Invalid integer/hex value: {val}") from e
 
+
 def _set_dd_debug_if_needed(ctx: Context, dd: DoserDevice) -> None:
     if ctx.obj and ctx.obj.get("debug"):
         dd.set_log_level("DEBUG")
 
+
 def _bhex(b: bytes | bytearray) -> str:
     return bytes(b).hex(" ").upper()
+
 
 # ────────────────────────────────────────────────────────────────
 # BYTES ENCODE — pretty-print & totals decode
@@ -147,12 +154,12 @@ def bytes_encode(
             norm = " ".join(f"{b:02x}" for b in value_bytes)
             typer.echo(f"[{idx}] {norm}   (len={len(value_bytes)})")
         else:
-            cmd_id      = value_bytes[0] if len(value_bytes) >= 1 else "????"
-            proto_ver   = value_bytes[1] if len(value_bytes) >= 2 else "????"
-            length_fld  = value_bytes[2] if len(value_bytes) >= 3 else None
-            msg_hi      = value_bytes[3] if len(value_bytes) >= 4 else "????"
-            msg_lo      = value_bytes[4] if len(value_bytes) >= 5 else "????"
-            mode        = value_bytes[5] if len(value_bytes) >= 6 else "????"
+            cmd_id = value_bytes[0] if len(value_bytes) >= 1 else "????"
+            proto_ver = value_bytes[1] if len(value_bytes) >= 2 else "????"
+            length_fld = value_bytes[2] if len(value_bytes) >= 3 else None
+            msg_hi = value_bytes[3] if len(value_bytes) >= 4 else "????"
+            msg_lo = value_bytes[4] if len(value_bytes) >= 5 else "????"
+            mode = value_bytes[5] if len(value_bytes) >= 6 else "????"
 
             total_after_header = max(0, len(value_bytes) - 7)
             if isinstance(length_fld, int):
@@ -166,29 +173,38 @@ def bytes_encode(
                 param_len = total_after_header
 
             params_start = 6
-            params_end   = min(len(value_bytes) - 1, params_start + param_len)
-            params_list  = [int(b) for b in value_bytes[params_start:params_end]]
-            checksum     = value_bytes[-1] if len(value_bytes) >= 1 else "????"
+            params_end = min(len(value_bytes) - 1, params_start + param_len)
+            params_list = [int(b) for b in value_bytes[params_start:params_end]]
+            checksum = value_bytes[-1] if len(value_bytes) >= 1 else "????"
 
             if PT_AVAILABLE:
                 table_obj = PrettyTable()
                 table_obj.set_style(SINGLE_BORDER)
                 table_obj.title = f"Encode Message #{idx}"
                 table_obj.field_names = [
-                    "Command Print", "Command ID", "Version", "Command Length",
-                    "Message ID High", "Message ID Low", "Mode", "Parameters", "Checksum",
+                    "Command Print",
+                    "Command ID",
+                    "Version",
+                    "Command Length",
+                    "Message ID High",
+                    "Message ID Low",
+                    "Mode",
+                    "Parameters",
+                    "Checksum",
                 ]
-                table_obj.add_row([
-                    str([int(b) for b in value_bytes]),
-                    str(cmd_id),
-                    str(proto_ver),
-                    str(length_fld if length_fld is not None else "????"),
-                    str(msg_hi),
-                    str(msg_lo),
-                    str(mode),
-                    str(params_list),
-                    str(checksum),
-                ])
+                table_obj.add_row(
+                    [
+                        str([int(b) for b in value_bytes]),
+                        str(cmd_id),
+                        str(proto_ver),
+                        str(length_fld if length_fld is not None else "????"),
+                        str(msg_hi),
+                        str(msg_lo),
+                        str(mode),
+                        str(params_list),
+                        str(checksum),
+                    ]
+                )
                 print(table_obj)
             else:
                 typer.echo(f"[#{idx}] Encode Message")
@@ -205,9 +221,10 @@ def bytes_encode(
                 vals = parse_totals_frame(value_bytes)
                 if vals:
                     typer.echo(
-                        f"Decoded totals (mL): "
+                        "Decoded totals (mL): "
                         f"CH1={vals[0]:.2f}, CH2={vals[1]:.2f}, CH3={vals[2]:.2f}, CH4={vals[3]:.2f}"
                     )
+
 
 # ────────────────────────────────────────────────────────────────
 # BYTES DECODE — parse text logs to CTL lines
@@ -231,6 +248,7 @@ def bytes_decode_to_ctl(
     dec = decode_records(recs)
     if print_raw:
         import json as _json
+
         typer.echo(_json.dumps(dec, indent=2))
 
     state = build_device_state(dec)
@@ -241,6 +259,7 @@ def bytes_decode_to_ctl(
 
     for ln in lines:
         typer.echo(ln)
+
 
 # ────────────────────────────────────────────────────────────────
 # Simple READ helpers
@@ -262,7 +281,9 @@ def read_dosing_auto(
         finally:
             if dd:
                 await dd.disconnect()
+
     asyncio.run(run())
+
 
 @app.command(name="read-dosing-container")
 def read_dosing_container(
@@ -281,7 +302,9 @@ def read_dosing_container(
         finally:
             if dd:
                 await dd.disconnect()
+
     asyncio.run(run())
+
 
 # ────────────────────────────────────────────────────────────────
 # Write helpers (now using cadence that makes schedules latch)
@@ -306,7 +329,9 @@ def cli_set_dosing_pump_manuell_ml(
         finally:
             if dd:
                 await dd.disconnect()
+
     asyncio.run(run())
+
 
 @app.command("enable-auto-mode-dosing-pump")
 def cli_enable_auto_mode_dosing_pump(
@@ -327,7 +352,9 @@ def cli_enable_auto_mode_dosing_pump(
         finally:
             if dd:
                 await dd.disconnect()
+
     asyncio.run(run())
+
 
 @app.command("add-setting-dosing-pump")
 def cli_add_setting_dosing_pump(
@@ -359,7 +386,7 @@ def cli_add_setting_dosing_pump(
             mask = encode_selected_weekdays(weekdays)
             tenths = int(round(ch_ml * 10))
 
-            acks = await program_channel_weekly_with_interval(
+            await program_channel_weekly_with_interval(
                 client,
                 channel=ch_id,
                 weekdays_mask=mask,
@@ -378,7 +405,9 @@ def cli_add_setting_dosing_pump(
         finally:
             if dd:
                 await dd.disconnect()
+
     asyncio.run(run())
+
 
 # ────────────────────────────────────────────────────────────────
 # Probe: LED totals
@@ -415,12 +444,12 @@ def cli_probe_totals(
             await dd.start_notify_tx()
             dd.add_notify_callback(_on_notify)
 
-            def _int0(v: str | int) -> int:  # local to command
+            def _int0_local(v: str | int) -> int:  # local to command
                 if isinstance(v, int):
                     return v
                 return int(str(v), 0)
 
-            modes = [_int0(m) for m in (mode_5b or ["0x34", "0x22"])]
+            modes = [_int0_local(m) for m in (mode_5b or ["0x34", "0x22"])]
             for m in modes:
                 frame = build_totals_query_5b(m)
                 try:
@@ -434,6 +463,7 @@ def cli_probe_totals(
                 vals = parse_totals_frame(payload) or []
                 if json_out:
                     import json as _json
+
                     out = {
                         "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                         "address": device_address,
@@ -455,12 +485,18 @@ def cli_probe_totals(
                 msg = "No totals frame received within timeout."
                 if json_out:
                     import json as _json
-                    typer.echo(_json.dumps({
-                        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-                        "address": device_address,
-                        "modes_tried": [f"0x{m:02X}" for m in modes],
-                        "error": msg,
-                    }, ensure_ascii=False))
+
+                    typer.echo(
+                        _json.dumps(
+                            {
+                                "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                                "address": device_address,
+                                "modes_tried": [f"0x{m:02X}" for m in modes],
+                                "error": msg,
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
                 else:
                     typer.echo(msg)
         except (BleakDeviceNotFoundError, BleakError, OSError):
@@ -474,6 +510,7 @@ def cli_probe_totals(
                     await dd.disconnect()
 
     asyncio.run(run())
+
 
 # ────────────────────────────────────────────────────────────────
 # Raw A5 frame sender
@@ -501,7 +538,9 @@ def cli_raw_dosing_pump(
         finally:
             if dd:
                 await dd.disconnect()
+
     asyncio.run(run())
+
 
 # ────────────────────────────────────────────────────────────────
 # Wireshark BLE to JSONL Parser
@@ -568,12 +607,15 @@ def wireshark_parse(
             if not value and isinstance(btatt.get("btatt.value_tree"), dict):
                 value = btatt["btatt.value_tree"].get("btatt.value")
 
-            if isinstance(method, list): method = method[0]
-            if isinstance(handle_val, list): handle_val = handle_val[0]
-            if isinstance(value, list): value = value[0]
+            if isinstance(method, list):
+                method = method[0]
+            if isinstance(handle_val, list):
+                handle_val = handle_val[0]
+            if isinstance(value, list):
+                value = value[0]
 
-            is_write = (method == "0x12")
-            is_notify = (method == "0x1b")
+            is_write = method == "0x12"
+            is_notify = method == "0x1b"
 
             if op == "write" and not is_write:
                 continue
@@ -587,8 +629,9 @@ def wireshark_parse(
                     return f"0x{int(h, 16):x}"
                 except Exception:
                     return (h or "").lower()
+
             if handle_val and _norm_handle(handle_val) != _norm_handle(handle):
-                if not (rx in ("only","also") and is_notify):
+                if not (rx in ("only", "also") and is_notify):
                     continue
 
             if not value:
@@ -603,4 +646,4 @@ def wireshark_parse(
                 "bytes_b64": base64.b64encode(data).decode("ascii"),
                 "len": len(data),
             }
-            typer.echo(json.dumps(out, separators=(",",":")))
+            typer.echo(json.dumps(out, separators=(",", ":")))

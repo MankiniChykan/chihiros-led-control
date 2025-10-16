@@ -1,3 +1,4 @@
+# custom_components/chihiros/light.py
 """LED BLE integration light platform."""
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from homeassistant.helpers.restore_state import RestoreEntity
 
 from .chihiros_led_control.device import BaseDevice
 from .const import DOMAIN, MANUFACTURER
-from .coordinator import ChihirosDataUpdateCoordinator
 from .models import ChihirosData
 
 _LOGGER = logging.getLogger(__name__)
@@ -32,10 +32,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up the light platform for LEDBLE."""
     chihiros_data: ChihirosData = hass.data[DOMAIN][entry.entry_id]
+
     # Do not create any lights for doser devices
     if getattr(chihiros_data.coordinator, "device_type", "led") != "led":
         return
+
     _LOGGER.debug("Setup chihiros entry: %s", chihiros_data.device.address)
+
     for color in chihiros_data.device.colors:
         _LOGGER.debug(
             "Setup chihiros light entity: %s - %s", chihiros_data.device.address, color
@@ -53,11 +56,11 @@ async def async_setup_entry(
 
 
 class ChihirosLightEntity(
-    PassiveBluetoothCoordinatorEntity[ChihirosDataUpdateCoordinator],
+    PassiveBluetoothCoordinatorEntity,  # keep PBCE behavior; no strict type param needed
     LightEntity,
     RestoreEntity,
 ):
-    """Representation of Chihiros device."""
+    """Representation of a Chihiros LED channel as a light."""
 
     _attr_assumed_state = True
     _attr_should_poll = False
@@ -66,7 +69,7 @@ class ChihirosLightEntity(
 
     def __init__(
         self,
-        coordinator: ChihirosDataUpdateCoordinator,
+        coordinator,
         chihiros_device: BaseDevice,
         config_entry: ConfigEntry,
         color: str,
@@ -74,20 +77,28 @@ class ChihirosLightEntity(
         """Initialise the entity."""
         super().__init__(coordinator)
         self._device = chihiros_device
-        self._address = coordinator.address
+        self._entry = config_entry
+        self._address = getattr(coordinator, "address", None) or "unknown"
         self._color = color
 
-        self._attr_name = f"{self._device.name} {self._color}"
+        name = getattr(self._device, "name", None) or "Chihiros LED"
+        model_name: str = getattr(self._device, "model_name", "LED")
+
+        self._attr_name = f"{name} {self._color}"
         self._attr_unique_id = f"{self._address}_{self._color}"
         self._attr_color = self._color
         self._attr_extra_state_attributes = {"color": self._color}
 
-        model_name: str = self._device.model_name
+        connections = (
+            {(dr.CONNECTION_BLUETOOTH, self._address)} if self._address != "unknown" else None
+        )
+        # Keep a single device tile per config entry; include BLE connection when we can.
         self._attr_device_info = DeviceInfo(
-            connections={(dr.CONNECTION_BLUETOOTH, self._address)},
+            identifiers={(DOMAIN, self._entry.entry_id)},
+            connections=connections,
             manufacturer=MANUFACTURER,
             model=model_name,
-            name=self._device.name,
+            name=name,
         )
 
     async def async_added_to_hass(self) -> None:
@@ -110,27 +121,33 @@ class ChihirosLightEntity(
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Instruct the light to turn on."""
-        if ATTR_BRIGHTNESS in kwargs:
-            brightness = int((kwargs[ATTR_BRIGHTNESS] / 255) * 100)
-            _LOGGER.debug("Turning on: %s to %s", self.name, brightness)
-            # TODO: handle error and availability False
-            await self._device.async_set_color_brightness(brightness, self._color)
-            self._attr_brightness = kwargs[ATTR_BRIGHTNESS]
-        else:
-            _LOGGER.debug("Turning on: %s", self.name)
-            await self._device.async_set_color_brightness(100, self._color)
-        self._attr_is_on = True
-        self._attr_available = True
-        self.schedule_update_ha_state()
-        _LOGGER.debug("Turned on: %s", self.name)
+        try:
+            if ATTR_BRIGHTNESS in kwargs:
+                # Convert HA 0..255 to device 0..100
+                brightness_pct = int((int(kwargs[ATTR_BRIGHTNESS]) / 255) * 100)
+                _LOGGER.debug("Turning on: %s to %s%%", self.name, brightness_pct)
+                await self._device.async_set_color_brightness(brightness_pct, self._color)
+                self._attr_brightness = int(kwargs[ATTR_BRIGHTNESS])
+            else:
+                _LOGGER.debug("Turning on: %s (100%%)", self.name)
+                await self._device.async_set_color_brightness(100, self._color)
+
+            self._attr_is_on = True
+            self._attr_available = True
+            self.async_write_ha_state()
+            _LOGGER.debug("Turned on: %s", self.name)
+        except Exception as e:
+            _LOGGER.warning("Failed to turn on %s: %s", self.name, e)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Instruct the light to turn off."""
         _LOGGER.debug("Turning off: %s", self.name)
-        # TODO handle error and availability False
-        await self._device.async_set_color_brightness(0, self._color)
-        self._attr_is_on = False
-        self._attr_brightness = 0
-        self._attr_available = True
-        self.schedule_update_ha_state()
-        _LOGGER.debug("Turned off: %s", self.name)
+        try:
+            await self._device.async_set_color_brightness(0, self._color)
+            self._attr_is_on = False
+            self._attr_brightness = 0
+            self._attr_available = True
+            self.async_write_ha_state()
+            _LOGGER.debug("Turned off: %s", self.name)
+        except Exception as e:
+            _LOGGER.warning("Failed to turn off %s: %s", self.name, e)

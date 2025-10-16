@@ -1,5 +1,11 @@
 # custom_components/chihiros/chihiros_led_control/device/base_device.py
-"""Module defining a base device class."""
+"""Base class for Chihiros LED devices.
+
+Notes:
+- No Home Assistant imports at module import time (lazy bleak + HA bits).
+- Uses bleak-retry-connector to share HA's Bluetooth proxy and retry logic.
+- Char UUIDs are sourced from the integration-level constants module.
+"""
 
 from __future__ import annotations
 
@@ -9,11 +15,14 @@ from abc import ABC, ABCMeta
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Union, Sequence
 
-# Keep top-level light: no bleak / retry imports here.
-if TYPE_CHECKING:  # editor-only types
+# Editor-only types; avoid importing bleak at runtime unless needed.
+if TYPE_CHECKING:  # pragma: no cover
     from bleak.backends.device import BLEDevice
     from bleak.backends.scanner import AdvertisementData
-    from bleak.backends.service import BleakGATTCharacteristic, BleakGATTServiceCollection
+    from bleak.backends.service import (
+        BleakGATTCharacteristic,
+        BleakGATTServiceCollection,
+    )
 else:
     BLEDevice = Any
     AdvertisementData = Any
@@ -31,8 +40,8 @@ BLEAK_BACKOFF_TIME = 0.25
 
 
 class _classproperty(property):
-    def __get__(self, owner_self: object, owner_cls: ABCMeta) -> str:  # type: ignore
-        ret: str = self.fget(owner_cls)  # type: ignore
+    def __get__(self, owner_self: object, owner_cls: ABCMeta) -> str:  # type: ignore[override]
+        ret: str = self.fget(owner_cls)  # type: ignore[misc]
         return ret
 
 
@@ -51,6 +60,7 @@ def _mk_ble_device(addr_or_ble: Union[BLEDevice, str]) -> BLEDevice:
     if isinstance(addr_or_ble, _BLEDevice):
         return addr_or_ble
     if _is_ha_runtime():
+        # Inside HA we should always be passed a BLEDevice (keeps proxy path correct).
         raise RuntimeError("In Home Assistant, pass a real BLEDevice (not a MAC string).")
     mac = str(addr_or_ble).upper()
     return _BLEDevice(mac, None, 0)
@@ -81,8 +91,10 @@ def _import_bleak_dbus_error():
     try:
         from bleak.exc import BleakDBusError  # type: ignore
     except Exception:
+
         class BleakDBusError(Exception):  # type: ignore
             pass
+
     return BleakDBusError
 
 
@@ -163,7 +175,9 @@ class BaseDevice(ABC):
         if color_id is None:
             self._logger.warning("Color not supported: `%s`", color)
             return
-        cmd = commands.create_manual_setting_command(self.get_next_msg_id(), color_id, int(brightness))
+        cmd = commands.create_manual_setting_command(
+            self.get_next_msg_id(), color_id, int(brightness)
+        )
         await self._send_command(cmd, 3)
 
     async def async_set_brightness(self, brightness: int) -> None:
@@ -172,6 +186,10 @@ class BaseDevice(ABC):
     async def async_set_manual_mode(self) -> None:
         for color_name in self._colors:
             await self.async_set_color_brightness(100, color_name)
+
+    # Back-compat shim for switch platform (expects enable_auto_mode)
+    async def enable_auto_mode(self) -> None:
+        await self.get_enable_auto_mode()
 
     # ---- commands (control helpers) ----
     async def get_turn_on(self) -> None:
@@ -215,7 +233,9 @@ class BaseDevice(ABC):
         if len(vals) == 4 and total > 400:
             raise ValueError("The values of RGBW (R+G+B+W) must not exceed 400%.")
         for chan_index, chan_value in enumerate(vals):
-            await self.async_set_color_brightness(brightness=chan_value, color=chan_index)
+            await self.async_set_color_brightness(
+                brightness=chan_value, color=chan_index
+            )
 
     async def get_add_rgb_setting(
         self,
@@ -352,18 +372,26 @@ class BaseDevice(ABC):
     def _notification_handler(
         self, _sender: BleakGATTCharacteristic, data: bytearray
     ) -> None:
-        self._logger.debug("%s: Notification received: %s", self.name, data.hex(" ").upper())
+        self._logger.debug(
+            "%s: Notification received: %s", self.name, data.hex(" ").upper()
+        )
         for cb in tuple(getattr(self, "_extra_notify_callbacks", [])):
             try:
                 cb(_sender, data)
             except Exception:
-                self._logger.debug("%s: notify callback raised", self.name, exc_info=True)
+                self._logger.debug(
+                    "%s: notify callback raised", self.name, exc_info=True
+                )
 
-    def add_notify_callback(self, cb: Callable[[BleakGATTCharacteristic, bytearray], None]) -> None:
+    def add_notify_callback(
+        self, cb: Callable[[BleakGATTCharacteristic, bytearray], None]
+    ) -> None:
         if cb not in getattr(self, "_extra_notify_callbacks", []):
             self._extra_notify_callbacks.append(cb)
 
-    def remove_notify_callback(self, cb: Callable[[BleakGATTCharacteristic, bytearray], None]) -> None:
+    def remove_notify_callback(
+        self, cb: Callable[[BleakGATTCharacteristic, bytearray], None]
+    ) -> None:
         try:
             self._extra_notify_callbacks.remove(cb)
         except ValueError:
@@ -373,9 +401,12 @@ class BaseDevice(ABC):
         if self._expected_disconnect:
             self._logger.debug("%s: Disconnected from device; RSSI: %s", self.name, self.rssi)
             return
-        self._logger.warning("%s: Device unexpectedly disconnected; RSSI: %s", self.name, self.rssi)
+        self._logger.warning(
+            "%s: Device unexpectedly disconnected; RSSI: %s", self.name, self.rssi
+        )
 
     def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> bool:
+        # Read: TX (device → host), Write: RX (host → device)
         for characteristic in [UART_TX_CHAR_UUID]:
             if char := services.get_characteristic(characteristic):
                 self._read_char = char
@@ -397,13 +428,15 @@ class BaseDevice(ABC):
                 self.name,
                 self.rssi,
             )
-        if self._client and self._client.is_connected:
+        if self._client and getattr(self._client, "is_connected", False):
             self._reset_disconnect_timer()
             return
+
         async with self._connect_lock:
-            if self._client and self._client.is_connected:
+            if self._client and getattr(self._client, "is_connected", False):
                 self._reset_disconnect_timer()
                 return
+
             self._logger.debug("%s: Connecting; RSSI: %s", self.name, self.rssi)
 
             if isinstance(self._ble_device, object) and hasattr(self._ble_device, "address"):
@@ -432,8 +465,10 @@ class BaseDevice(ABC):
             self._reset_disconnect_timer()
 
             if resolved and self._read_char:
-                self._logger.debug("%s: Subscribe to notifications; RSSI: %s", self.name, self.rssi)
-                await client.start_notify(self._read_char, self._notification_handler)  # type: ignore
+                self._logger.debug(
+                    "%s: Subscribe to notifications; RSSI: %s", self.name, self.rssi
+                )
+                await client.start_notify(self._read_char, self._notification_handler)  # type: ignore[arg-type]
             else:
                 raise CharacteristicMissingError("Failed to resolve UART characteristics")
 
@@ -451,7 +486,9 @@ class BaseDevice(ABC):
         if self._disconnect_timer:
             self._disconnect_timer.cancel()
         self._expected_disconnect = False
-        self._disconnect_timer = self.loop.call_later(DISCONNECT_DELAY, self._disconnect)
+        self._disconnect_timer = self.loop.call_later(
+            DISCONNECT_DELAY, self._disconnect
+        )
 
     async def disconnect(self) -> None:
         self._logger.debug("%s: Disconnecting", self.name)
@@ -472,7 +509,11 @@ class BaseDevice(ABC):
                     try:
                         await client.stop_notify(read_char)
                     except Exception:
-                        self._logger.debug("%s: stop_notify failed (already stopped?)", self.name, exc_info=True)
+                        self._logger.debug(
+                            "%s: stop_notify failed (already stopped?)",
+                            self.name,
+                            exc_info=True,
+                        )
                 await client.disconnect()
 
     def _disconnect(self) -> None:
@@ -480,7 +521,9 @@ class BaseDevice(ABC):
         asyncio.create_task(self._execute_timed_disconnect())
 
     async def _execute_timed_disconnect(self) -> None:
-        self._logger.debug("%s: Disconnecting after timeout of %s", self.name, DISCONNECT_DELAY)
+        self._logger.debug(
+            "%s: Disconnecting after timeout of %s", self.name, DISCONNECT_DELAY
+        )
         await self._execute_disconnect()
 
 
