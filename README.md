@@ -86,6 +86,26 @@ chihirosctl reset-settings <device-address>
 
 ```
 
+## Retrieving the Xiaomi MiBeacon bind key
+
+Xiaomi encrypts the MiBeacon payloads broadcast by Chihiros hardware. To decrypt them you need the per-device bind key that is
+provisioned when the light or doser is paired with a Mi Account in the Mi Home app. This repository ships a helper CLI that logs
+into Xiaomi's cloud and requests the key for you.
+
+1. Pair your device with Mi Home and note the `did` shown in the device info page.
+2. Install the project in a virtual environment as shown above (`pip install -e .`).
+3. Run the helper and provide your Mi Account credentials when prompted:
+
+   ```bash
+   chihiros-bind-key fetch --username you@example.com --did <mi-device-id> --region de
+   ```
+
+   * Use the two-letter region that matches your Mi Home account (`cn`, `de`, `us`, `sg`, ...). The default is `de` (Europe).
+   * Add `--json` to print the decrypted Xiaomi response or `--all` to list every key returned by the API.
+
+The command prints a table with the bind key, MAC address, and product identifier. Copy the bind key into your Home Assistant
+configuration or CLI environment to enable MiBeacon decryption.
+
 ## Protocol
 
 The vendor app uses Bluetooth LE to communicate with the LED. The LED advertises a UART service with the UUID `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`. This service contains a RX characteristic with the UUID `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`. This characteristic can be used to send commands to the LED. The LED will respond to commands by sending a notification to the corresponding TX service with the UUID `6E400003-B5A3-F393-E0A9-E50E24DCCA9E`.
