@@ -13,10 +13,7 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, CoordinatorEntity
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-# --- Kill-switch: keep file details but stop functionality entirely ---
-DISABLE_DOSER_TOTAL_SENSORS: bool = True
-
-# Keep type hints without importing heavy deps at runtime when disabled
+# Keep type hints without importing heavy deps at runtime
 if TYPE_CHECKING:
     from bleak_retry_connector import (
         BleakClientWithServiceCache,
@@ -35,12 +32,7 @@ UPDATE_EVERY = timedelta(minutes=15)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    """Platform entry point — intentionally inert when disabled."""
-    if DISABLE_DOSER_TOTAL_SENSORS:
-        _LOGGER.info("chihiros.sensor: totals sensors are DISABLED; skipping setup for %s", entry.entry_id)
-        return
-
-    # --- Original setup code preserved below (will not run while disabled) ---
+    """Set up daily totals sensors for a configured device."""
     data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     address: Optional[str] = getattr(getattr(data, "coordinator", None), "address", None)
     _LOGGER.debug("chihiros.sensor: setup entry=%s addr=%s", entry.entry_id, address)
@@ -95,12 +87,7 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._lock = asyncio.Lock()  # avoid overlapping BLE connects
 
     async def _async_update_data(self) -> dict[str, Any]:
-        # Stay inert even if somehow called while disabled
-        if DISABLE_DOSER_TOTAL_SENSORS:
-            _LOGGER.debug("sensor: coordinator update skipped (disabled)")
-            return self._last
-
-        # Lazy-import runtime-only deps so the module can live without them when disabled
+        # Lazy-import runtime-only deps so the module can load without bleak/Home Assistant extras during linting
         from bleak_retry_connector import (
             BleakClientWithServiceCache,
             BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC,
