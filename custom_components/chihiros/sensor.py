@@ -9,7 +9,7 @@ returning mL values as decoded by protocol.parse_totals_frame().
 How it works (aligned with protocol.py):
 • On each scheduled refresh, we connect over BLE (via HA's connector),
   subscribe to UART_TX notifications, and send a tiny set of LED-side probes
-  built by protocol.build_totals_probes() (0x34, then 0x22).
+  built by protocol.build_totals_probes() (0x34, then 0x22, and 0x1E).
 • The first notify that protocol.parse_totals_frame(...) can decode into four
   channel values wins; we cache and expose it via DataUpdateCoordinator.
 • The coordinator also accepts “push” updates via the dispatcher signal
@@ -40,7 +40,7 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 # Seconds to wait for a single totals notify (0x5B …)
-SCAN_TIMEOUT = 12.0
+SCAN_TIMEOUT = 15.0
 # Coordinator polling cadence (you can adjust in the future)
 UPDATE_EVERY = timedelta(minutes=15)
 
@@ -184,29 +184,53 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 except Exception:
                     frames = []
 
-                # Fallback: try common LED-side modes
+                # Fallback: try common LED-side modes (including 0x1E seen in field logs)
                 if not frames:
                     try:
                         frames.extend(
                             [
                                 dp.encode_5b(0x34, []),
                                 dp.encode_5b(0x22, []),
+                                dp.encode_5b(0x1E, []),
                             ]
                         )
                     except Exception:
                         pass
 
-                # Write probes; most devices accept on UART_RX, a few on TX (so guard)
+                # Write probes; try RX (resp/wo-resp) then TX (resp/wo-resp)
                 for idx, frame in enumerate(frames):
+                    wrote = False
+
+                    # RX + response
                     try:
                         await client.write_gatt_char(UART_RX, frame, response=True)  # type: ignore
+                        wrote = True
                     except Exception:
+                        # RX without response
+                        try:
+                            await client.write_gatt_char(UART_RX, frame, response=False)  # type: ignore
+                            wrote = True
+                        except Exception:
+                            pass
+
+                    if not wrote:
+                        # TX + response
                         try:
                             await client.write_gatt_char(UART_TX, frame, response=True)  # type: ignore
+                            wrote = True
                         except Exception:
-                            _LOGGER.debug(
-                                "sensor: probe write failed (idx=%d)", idx, exc_info=True
-                            )
+                            # TX without response
+                            try:
+                                await client.write_gatt_char(UART_TX, frame, response=False)  # type: ignore
+                                wrote = True
+                            except Exception:
+                                pass
+
+                    if not wrote:
+                        _LOGGER.debug(
+                            "sensor: probe write failed (idx=%d)", idx, exc_info=True
+                        )
+
                     await asyncio.sleep(0.08)  # keep under SCAN_TIMEOUT budget
 
                 try:

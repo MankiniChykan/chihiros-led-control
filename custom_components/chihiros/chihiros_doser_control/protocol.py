@@ -268,18 +268,18 @@ def build_totals_query() -> bytes:
 def build_totals_probes() -> list[bytes]:
     """
     Return a small set of viable totals queries across firmwares.
-    STRICTLY LED (0x5B) now: try 0x34 first, then 0x22.
+    STRICTLY LED (0x5B): try 0x34, 0x22, and 0x1E (seen in your logs).
     """
     frames: list[bytes] = []
-    frames.append(encode_5b(0x34, []))  # daily totals (preferred)
-    frames.append(encode_5b(0x22, []))  # alt fw
+    for m in (0x34, 0x22, 0x1E):
+        frames.append(encode_5b(m, []))
+        frames.append(encode_5b(m, []))  # send each twice to wake some firmwares
     # de-dup preserving order
     seen, uniq = set(), []
     for f in frames:
         b = bytes(f)
         if b not in seen:
-            seen.add(b)
-            uniq.append(f)
+            seen.add(b); uniq.append(f)
     return uniq
 
 # ────────────────────────────────────────────────────────────────
