@@ -21,9 +21,12 @@ It is designed to match the on-wire behaviour observed in logs:
 All frames avoid 0x5A in payload bytes and rotate message IDs
 away from 0x5A in either byte, with XOR checksum over the body.
 
-The public methods here are intentionally small and opinionated:
+Public methods (opinionated but small):
   - connect()/disconnect()
   - start/stop notify on TX; add/remove notify callbacks
+  - read_burst()                           <-- NEW
+  - query_totals_with_burst()              <-- NEW
+  - dose_then_capture_totals()             <-- NEW
   - set_dosing_pump_manuell_ml()
   - enable_auto_mode_dosing_pump()
   - read_dosing_pump_auto_settings()   (passive decode printer)
@@ -40,9 +43,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime  # kept for external callers / parity
-from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Iterable, List, Optional, Set, Tuple, Dict
 
 # Windows CLI nicety; harmless elsewhere
 if os.name == "nt":
@@ -153,6 +157,65 @@ def encode_selected_weekdays(values: Iterable[str | int]) -> int:
 
 
 # ────────────────────────────────────────────────────────────────
+# Burst capture primitives
+# ────────────────────────────────────────────────────────────────
+@dataclass
+class BurstResult:
+    """Result of a single UART_TX notification burst."""
+    started_at: float
+    ended_at: float
+    frames: List[bytes] = field(default_factory=list)
+    total_bytes: int = 0
+
+
+class _BurstCollector:
+    """Collect UART_TX notify frames until idle or max duration reached."""
+
+    def __init__(self, idle_ms: int = 450, max_ms: int = 5500, log: Optional[logging.Logger] = None):
+        self.idle_ms = int(idle_ms)
+        self.max_ms = int(max_ms)
+        self._log = log or _LOG
+        self._started = 0.0
+        self._last = 0.0
+        self._frames: List[bytes] = []
+        self._total = 0
+        loop = asyncio.get_event_loop()
+        self._done: asyncio.Future[BurstResult] = loop.create_future()
+        self._watch: Optional[asyncio.Task] = None
+
+    def feed(self, frame: bytes) -> None:
+        now = time.monotonic()
+        if not self._frames:
+            self._started = now
+            # arm watchdog on first frame
+            self._watch = asyncio.create_task(self._watchdog())
+        self._last = now
+        self._frames.append(frame)
+        self._total += len(frame)
+
+    async def _watchdog(self) -> None:
+        start = self._started or time.monotonic()
+        # periodic check for idle or max window
+        while True:
+            await asyncio.sleep(self.idle_ms / 1000.0)
+            now = time.monotonic()
+            if self._frames and (now - self._last) * 1000.0 >= self.idle_ms:
+                break
+            if (now - start) * 1000.0 >= self.max_ms:
+                break
+        if not self._done.done():
+            self._done.set_result(BurstResult(
+                started_at=self._started or start,
+                ended_at=time.monotonic(),
+                frames=self._frames[:],
+                total_bytes=self._total,
+            ))
+
+    async def wait(self) -> BurstResult:
+        return await self._done
+
+
+# ────────────────────────────────────────────────────────────────
 # BLE helper
 # ────────────────────────────────────────────────────────────────
 async def _resolve_ble_or_fail(address_or_name: str) -> "BleakClient":
@@ -189,30 +252,33 @@ class _Callbacks:
 
 
 class DoserDevice:
-    """Minimal BLE client for the doser using Nordic UART."""
+    """Minimal BLE client for the doser using Nordic UART with burst capture."""
 
     def __init__(self, client: "BleakClient"):
         self._client = client
         self._callbacks = _Callbacks(notify=set())
         self._log = _LOG
+        self._active_burst: Optional[_BurstCollector] = None
 
     # Public: logging
     def set_log_level(self, level: str = "INFO") -> None:
         self._log.setLevel(getattr(logging, level.upper(), logging.INFO))
 
-    # Public: connect / disconnect
-    async def connect(self) -> "BleakClient":
+    # Internal: ensure services (refresh=True to bust stale cache after proxy swaps)
+    async def _ensure_services(self, refresh: bool = True) -> None:
         prot = _protocol()
         UART_SERVICE = prot["UART_SERVICE"]
+        svcs = await self._client.get_services(refresh)
+        have = {s.uuid.upper() for s in svcs.services}
+        if UART_SERVICE not in have:
+            raise RuntimeError("UART service not present on device (service cache stale or wrong peripheral)")
+
+    # Public: connect / disconnect
+    async def connect(self) -> "BleakClient":
         if not self._client.is_connected:
             await self._client.connect()
-            # Confirm UART service is present (best-effort)
-            try:
-                svcs = await self._client.get_services()
-                if UART_SERVICE not in {s.uuid.upper() for s in svcs.services}:
-                    self._log.debug("UART service not listed, continuing anyway.")
-            except Exception:
-                pass
+        # force a fresh discovery to avoid "characteristic not found" after proxy handoffs
+        await self._ensure_services(refresh=True)
         return self._client
 
     async def disconnect(self) -> None:
@@ -222,17 +288,28 @@ class DoserDevice:
         except Exception:
             pass
 
-    # Public: notifications on TX
+    # Public: notifications on TX (notify-first)
     async def start_notify_tx(self) -> None:
         UART_TX = _protocol()["UART_TX"]
 
         def _cb(handle: int, data: bytearray):
+            # Feed burst collector if running
+            bc = self._active_burst
+            if bc:
+                try:
+                    bc.feed(bytes(data))
+                except Exception:
+                    # never raise from callback
+                    pass
+            # Fan out to user callbacks
             for fn in list(self._callbacks.notify):
                 try:
                     fn("tx", data)
                 except Exception:
                     self._log.exception("notify-callback error")
 
+        # (re)ensure services in case notify is called after reconnect
+        await self._ensure_services(refresh=False)
         await self._client.start_notify(UART_TX, _cb)
 
     async def stop_notify_tx(self) -> None:
@@ -248,11 +325,170 @@ class DoserDevice:
     def remove_notify_callback(self, cb: NotifyCallback) -> None:
         self._callbacks.notify.discard(cb)
 
-    # Public: writes
+    # ────────────────────────────────────────────────────────────────
+    # Burst capture API
+    # ────────────────────────────────────────────────────────────────
+    async def read_burst(self, *, idle_ms: int = 450, max_ms: int = 5500, timeout_pad_s: float = 2.0) -> BurstResult:
+        """
+        Collect all UART_TX notifications until the link is idle for `idle_ms`
+        or until `max_ms` passes. Returns the frames and simple diagnostics.
+        """
+        # Arm collector
+        self._active_burst = _BurstCollector(idle_ms=idle_ms, max_ms=max_ms, log=self._log)
+        try:
+            # Add a small timeout pad to avoid hanging if no frames arrive
+            burst = await asyncio.wait_for(self._active_burst.wait(), timeout=(max_ms / 1000.0) + float(timeout_pad_s))
+            return burst
+        finally:
+            self._active_burst = None
+
+    # ────────────────────────────────────────────────────────────────
+    # High-level helpers using burst capture
+    # ────────────────────────────────────────────────────────────────
+    async def query_totals_with_burst(self, *, idle_ms: int = 450, max_ms: int = 5500) -> Tuple[Optional[Dict[str, Any]], BurstResult, Dict[str, Any]]:
+        """
+        Start notify FIRST, send 0x5B totals probes, capture burst, parse last totals.
+
+        Returns (totals_dict_or_none, burst, diag)
+        """
+        prot = _protocol()
+        UART_RX = prot["UART_RX"]
+        build_totals_query_5b = prot["build_totals_query_5b"]
+        parse_totals_frame = prot["parse_totals_frame"]
+
+        client = await self.connect()
+        await self.start_notify_tx()
+        # let CCCD settle to avoid missing the first notify on some stacks
+        await asyncio.sleep(0.15)
+
+        # Send a couple of known-good totals probes (as you already do in HA)
+        probes = [
+            build_totals_query_5b(seq=0x06),  # 1E probe
+            build_totals_query_5b(seq=0x07),  # 22 probe
+        ]
+        for frame in probes:
+            try:
+                await client.write_gatt_char(UART_RX, frame, response=True)
+                await asyncio.sleep(0.12)  # small pacing between writes
+            except Exception:
+                # Try one service refresh and retry once
+                await self._ensure_services(refresh=True)
+                await client.write_gatt_char(UART_RX, frame, response=True)
+                await asyncio.sleep(0.12)
+
+        # Capture everything the device says
+        burst = await self.read_burst(idle_ms=idle_ms, max_ms=max_ms)
+
+        # Parse: pick the last valid 0x5B totals in the burst
+        best = None
+        seen_cmds: List[int] = []
+        for raw in burst.frames:
+            if not raw:
+                continue
+            seen_cmds.append(raw[0])
+            try:
+                dec = parse_totals_frame(raw)
+                if dec:
+                    best = dec
+            except Exception:
+                continue
+
+        diag = {
+            "frames_in_burst": len(burst.frames),
+            "seen_cmds": seen_cmds,
+            "had_totals": best is not None,
+            "burst_duration_ms": int((burst.ended_at - burst.started_at) * 1000),
+            "burst_total_bytes": burst.total_bytes,
+        }
+        return best, burst, diag
+
+    async def dose_then_capture_totals(
+        self,
+        *,
+        channel_1based: int,
+        ml: float | int | str,
+        idle_ms: int = 450,
+        max_ms: int = 6000,
+        send_extra_probes: bool = True,
+    ) -> Tuple[Optional[Dict[str, Any]], BurstResult, Dict[str, Any]]:
+        """
+        Perform a manual dose and capture the post-dose UART burst on the SAME connection.
+
+        Returns (totals_dict_or_none, burst, diag)
+        """
+        prot = _protocol()
+        UART_RX = prot["UART_RX"]
+        dose_ml_fn = prot["dose_ml"]
+        build_totals_query_5b = prot["build_totals_query_5b"]
+        parse_totals_frame = prot["parse_totals_frame"]
+
+        client = await self.connect()
+        await self.start_notify_tx()
+        await asyncio.sleep(0.15)
+
+        # (optional) prime totals queries before and after the dose; some FW replies slower
+        pre_probes = [build_totals_query_5b(seq=0x0D), build_totals_query_5b(seq=0x0E)]
+        for frame in pre_probes:
+            try:
+                await client.write_gatt_char(UART_RX, frame, response=True)
+                await asyncio.sleep(0.10)
+            except Exception:
+                await self._ensure_services(refresh=True)
+                await client.write_gatt_char(UART_RX, frame, response=True)
+                await asyncio.sleep(0.10)
+
+        # Write the dose frame on the same session
+        await dose_ml_fn(client, channel_1based=int(channel_1based), ml=ml)
+
+        if send_extra_probes:
+            post_probes = [build_totals_query_5b(seq=0x12), build_totals_query_5b(seq=0x13)]
+            for frame in post_probes:
+                try:
+                    await client.write_gatt_char(UART_RX, frame, response=True)
+                    await asyncio.sleep(0.12)
+                except Exception:
+                    await self._ensure_services(refresh=True)
+                    await client.write_gatt_char(UART_RX, frame, response=True)
+                    await asyncio.sleep(0.12)
+
+        # Capture all UART_TX chatter after dose
+        burst = await self.read_burst(idle_ms=idle_ms, max_ms=max_ms)
+
+        # Parse: prefer the last totals if present
+        best = None
+        seen_cmds: List[int] = []
+        for raw in burst.frames:
+            if not raw:
+                continue
+            seen_cmds.append(raw[0])
+            try:
+                dec = parse_totals_frame(raw)
+                if dec:
+                    best = dec
+            except Exception:
+                continue
+
+        diag = {
+            "frames_in_burst": len(burst.frames),
+            "seen_cmds": seen_cmds,
+            "had_totals": best is not None,
+            "burst_duration_ms": int((burst.ended_at - burst.started_at) * 1000),
+            "burst_total_bytes": burst.total_bytes,
+            "channel_1based": int(channel_1based),
+            "ml": float(ml) if isinstance(ml, (int, float, str)) and str(ml).replace('.', '', 1).isdigit() else ml,
+        }
+        return best, burst, diag
+
+    # ────────────────────────────────────────────────────────────────
+    # Basic writes (kept for compatibility)
+    # ────────────────────────────────────────────────────────────────
     async def set_dosing_pump_manuell_ml(self, ch_id: int, ml: float | int | str) -> None:
         """Immediate one-shot dose using 25.6+0.1 encoding (A5/27)."""
         dose_ml = _protocol()["dose_ml"]
         client = await self.connect()
+        await self.start_notify_tx()  # harmless if caller forgets; keeps us ready
+        await asyncio.sleep(0.05)
+        # NOTE: upstream `dose_ml` expects 1-based channel index
         await dose_ml(client, channel_1based=(int(ch_id) + 1), ml=ml)
 
     async def enable_auto_mode_dosing_pump(self, ch_id: int) -> None:
@@ -271,11 +507,14 @@ class DoserDevice:
         create_switch_to_auto_mode_dosing_pump_command = cmds["create_switch_to_auto_mode_dosing_pump_command"]
 
         client = await self.connect()
+        await self.start_notify_tx()
+        await asyncio.sleep(0.05)
 
         # Set time
         msg_hi, msg_lo = 0, 0
         frame_time = create_set_time_command((msg_hi, msg_lo))
         await client.write_gatt_char(UART_RX, frame_time, response=True)
+        await asyncio.sleep(0.10)
 
         # Switch to auto
         msg_hi, msg_lo = 0, 1
@@ -285,8 +524,8 @@ class DoserDevice:
             bytes(frame_auto),
             expect_cmd=CMD_MANUAL_DOSE,
             expect_ack_mode=0x07,
-            ack_timeout_ms=400,
-            heartbeat_min_ms=300,
+            ack_timeout_ms=600,          # slightly relaxed for proxies
+            heartbeat_min_ms=250,
             heartbeat_max_ms=900,
             retries=1,
         )
@@ -296,13 +535,18 @@ class DoserDevice:
         UART_RX = _protocol()["UART_RX"]
         create_command = _dosingcommands()["create_command_encoding_dosing_pump"]
         client = await self.connect()
+        await self.start_notify_tx()
+        await asyncio.sleep(0.05)
         msg_hi, msg_lo = 0, 0
         for _ in range(int(repeats)):
             frame = create_command(cmd_id, mode, (msg_hi, msg_lo), [int(p) & 0xFF for p in params])
             await client.write_gatt_char(UART_RX, frame, response=True)
+            await asyncio.sleep(0.12)
             msg_lo = (msg_lo + 1) & 0xFF
 
-    # Public: “read” helpers (passive parse/printer)
+    # ────────────────────────────────────────────────────────────────
+    # Passive “reads” (printers)
+    # ────────────────────────────────────────────────────────────────
     async def read_dosing_pump_auto_settings(self, *, ch_id: int | None = None, timeout_s: float = 2.0) -> None:
         """
         Passive listener that prints any A5 frames we can interpret into a CTL-style
@@ -351,7 +595,7 @@ class DoserDevice:
         this function will show them as raw hex. (We keep this generic until
         we have stable decode samples across models.)
         """
-        client = await self.connect()
+        await self.connect()
         got: list[str] = []
 
         def _cb(_kind: str, payload: bytearray) -> None:
@@ -379,12 +623,44 @@ if not _is_ha_runtime():
     try:
         import typer  # type: ignore
 
-        app = typer.Typer(help="Chihiros Doser (base app)")
+        app = typer.Typer(help="Chihiros Doser (base app with burst capture)")
 
         @app.callback()
         def _root():
             """Base app for chihirosdoserctl.py to extend."""
             pass
+
+        @app.command("totals-burst")
+        def _totals_burst(addr: str, idle_ms: int = 450, max_ms: int = 5500):
+            """Query totals using 0x5B probes and burst-capture the reply."""
+            async def _run():
+                BleakClient, _ = _bleak()
+                dev = DoserDevice(BleakClient(addr))
+                totals, burst, diag = await dev.query_totals_with_burst(idle_ms=idle_ms, max_ms=max_ms)
+                if totals:
+                    P(f"Totals: {totals}")
+                else:
+                    P("No totals detected in burst.")
+                P(f"Diag: {diag}")
+                await dev.disconnect()
+            asyncio.run(_run())
+
+        @app.command("dose-and-capture")
+        def _dose_and_capture(addr: str, ch: int, ml: float, idle_ms: int = 450, max_ms: int = 6000):
+            """Send manual dose and capture totals on the same connection."""
+            async def _run():
+                BleakClient, _ = _bleak()
+                dev = DoserDevice(BleakClient(addr))
+                totals, burst, diag = await dev.dose_then_capture_totals(
+                    channel_1based=int(ch), ml=ml, idle_ms=idle_ms, max_ms=max_ms
+                )
+                if totals:
+                    P(f"Totals: {totals}")
+                else:
+                    P("No totals detected in post-dose burst.")
+                P(f"Diag: {diag}")
+                await dev.disconnect()
+            asyncio.run(_run())
 
         P = typer.echo  # nicer CLI printing
     except Exception:

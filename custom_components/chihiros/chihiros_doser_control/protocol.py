@@ -250,13 +250,20 @@ def build_interval_entry(channel: int, interval_min: int, times_per_day: int) ->
 # ────────────────────────────────────────────────────────────────
 # Totals helpers (LED-style 0x5B only)
 # ────────────────────────────────────────────────────────────────
-def build_totals_query_5b(mode_5b: int = 0x34) -> bytes:
-    """Prefer 0x5B daily totals query; default mode 0x34 (some fw use 0x22)."""
+def build_totals_query_5b(*, mode_5b: int = 0x34, seq: Optional[int] = None) -> bytes:
+    """
+    Prefer 0x5B daily totals query; default mode 0x34 (some fw use 0x22).
+
+    NOTE: `seq` is accepted for API compatibility with higher layers that
+    may supply an application-level sequence. The internal message-id is
+    always generated here; `seq` is intentionally ignored.
+    """
+    _ = seq  # ignored; message-id comes from _next_msg_id()
     return encode_5b(mode_5b, [])
 
 def build_totals_query() -> bytes:
     """Back-compat single-frame helper; still LED-first (0x34)."""
-    return build_totals_query_5b(0x34)
+    return build_totals_query_5b(mode_5b=0x34)
 
 def build_totals_probes() -> list[bytes]:
     """

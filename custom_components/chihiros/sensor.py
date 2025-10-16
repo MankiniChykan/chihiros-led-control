@@ -118,7 +118,7 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name=f"{DOMAIN}-doser-totals",
             update_interval=UPDATE_EVERY,
         )
-        self.address = address
+        self.address = (address or "").upper() or None
         self.entry = entry
         self._last: dict[str, Any] = {"ml": [None, None, None, None], "raw": None}
         self._lock = asyncio.Lock()  # avoid overlapping BLE connects
@@ -147,7 +147,7 @@ class DoserTotalsCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # HA stores addresses uppercase
             ble_dev = bluetooth.async_ble_device_from_address(
-                self.hass, self.address.upper(), True
+                self.hass, self.address, True
             )
             if not ble_dev:
                 _LOGGER.debug(
