@@ -155,7 +155,7 @@ The auto mode and its settings can be reset by sending the following command:
 
 ## Doser Additions (Beta)
 
-> The doser protocol and entities are **beta**. In Home Assistant, only **`chihiros.dose_ml`** is exposed right now; schedule/total-related services and sensors are intentionally disabled until they are robust across firmware variants.
+> The doser protocol and entities are **beta**. Home Assistant now exposes manual dosing, daily total sensors, and scheduling services, but firmware differences may still affect reliability. Please report any quirks you encounter.
 
 ### Supported Doser Devices
 
@@ -163,7 +163,7 @@ The auto mode and its settings can be reset by sending the following command:
 
 ### Home Assistant (Doser)
 
-* **Service (enabled):**
+* **Services:**
 
   * `chihiros.dose_ml` — one-shot manual dose on a selected channel (mL)
 
@@ -174,14 +174,13 @@ The auto mode and its settings can be reset by sending the following command:
       channel: 1       # human-friendly 1..4 (converted to wire 0..3)
       ml: 10.5         # 0.2 .. 999.9 (0.1 mL resolution)
     ```
-* **Services (currently disabled):**
+  * `chihiros.read_daily_totals` — query today’s per-channel totals and surface them in HA
+  * `chihiros.set_24h_dose` — configure a once-per-day schedule (time, days, catch-up)
 
-  * `read_daily_totals` — query “today’s per-channel totals”
-  * `set_24h_dose` — configure a once-per-day schedule (time, days, catch-up)
-* **Entities (current state):**
+* **Entities:**
 
   * Buttons/Numbers per channel for dosing operations
-  * Daily total sensors are present in code but **disabled** in the integration build
+  * Daily total sensors (per channel) reporting today’s totals in mL
 
 ### Using the CLI (Doser)
 
@@ -220,14 +219,14 @@ chihirosctl bytes-encode "5B 01 0A 00 01 22 00 00 00 00 00 00 00 00 00"
   * Params: `[ channel(0..3), 0, 0, ml_hi, ml_lo ]`
     `ml_hi = floor(ml/25.6)`, `ml_lo = round((ml - ml_hi*25.6)*10)` (0.1 mL)
 
-* **24-hour daily schedule** *(not exposed as HA service in this build)*
+* **24-hour daily schedule**
   Typical sequence observed on devices:
 
   * Time/type: `A5/0x15` → `[ ch, 1 /*24h*/, hour, minute, 0, 0 ]`
   * Amount:    `A5/0x1B` → `[ ch, weekday_mask, 1, 0, ml_hi, ml_lo ]`
   * Catch-up:  `A5/0x20` → `[ ch, 0, catch_up(0/1) ]`
 
-* **“Daily totals” query** *(sensors/services disabled in this build)*
+* **“Daily totals” query**
 
   * Query frames: LED-style `0x5B/0x22` or `0x5B/0x1E` (no params)
   * Replies include 8 params (hi/lo pairs) decoding to four per-channel mL totals.

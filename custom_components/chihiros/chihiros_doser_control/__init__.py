@@ -60,12 +60,6 @@ else:
     _LOGGER = logging.getLogger(__name__)
 
     # ────────────────────────────────────────────────────────────
-    # Feature flags (disable problematic services)
-    # ────────────────────────────────────────────────────────────
-    DISABLE_READ_DAILY_TOTALS: bool = True
-    DISABLE_SET_24H_DOSE: bool = True
-
-    # ────────────────────────────────────────────────────────────
     # Schemas
     # ────────────────────────────────────────────────────────────
     DOSE_SCHEMA = vol.Schema({
@@ -321,34 +315,30 @@ else:
         hass.services.async_register(DOMAIN, "dose_ml", _svc_dose, schema=DOSE_SCHEMA)
 
         # -------------------------
-        # Read & print daily totals — DISABLED
+        # Read & print daily totals
         # -------------------------
-        if DISABLE_READ_DAILY_TOTALS:
-            async def _svc_disabled_read(_call: ServiceCall):
-                raise HomeAssistantError("Disabled: 'read_daily_totals' is not available in this build.")
-            hass.services.async_register(DOMAIN, "read_daily_totals", _svc_disabled_read)
-        else:
-            # (Commented-out registration; preserved for later re-enable)
-            # hass.services.async_register(DOMAIN, "read_daily_totals", _svc_read_totals, schema=READ_TOTALS_SCHEMA)
-            pass
+        hass.services.async_register(
+            DOMAIN,
+            "read_daily_totals",
+            _svc_read_totals,
+            schema=READ_TOTALS_SCHEMA,
+        )
 
         # -------------------------
-        # Configure 24-hour dosing — DISABLED
+        # Configure 24-hour dosing
         # -------------------------
-        if DISABLE_SET_24H_DOSE:
-            async def _svc_disabled_set24h(_call: ServiceCall):
-                raise HomeAssistantError("Disabled: 'set_24h_dose' is not available in this build.")
-            hass.services.async_register(DOMAIN, "set_24h_dose", _svc_disabled_set24h)
-        else:
-            # (Commented-out registration; preserved for later re-enable)
-            # hass.services.async_register(DOMAIN, "set_24h_dose", _svc_set_24h, schema=SET_24H_SCHEMA)
-            pass
+        hass.services.async_register(
+            DOMAIN,
+            "set_24h_dose",
+            _svc_set_24h,
+            schema=SET_24H_SCHEMA,
+        )
 
     # ────────────────────────────────────────────────────────────
-    # ORIGINAL (kept for reference) — not registered while disabled
+    # Service handlers
     # ────────────────────────────────────────────────────────────
     async def _svc_read_totals(call: ServiceCall):
-        """Original handler retained but **not registered** while disabled."""
+        """Query the doser for the current daily totals and surface them in HA."""
         data = READ_TOTALS_SCHEMA(dict(call.data))
 
         addr = data.get("address")
@@ -433,7 +423,7 @@ else:
                     pass
 
     async def _svc_set_24h(call: ServiceCall):
-        """Original handler retained but **not registered** while disabled."""
+        """Configure a daily dosing schedule with time-of-day and weekdays."""
         data = SET_24H_SCHEMA(dict(call.data))
 
         # Resolve address
