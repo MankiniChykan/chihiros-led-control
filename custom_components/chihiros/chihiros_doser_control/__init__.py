@@ -1,13 +1,12 @@
-# custom_components/chihiros/chihiros_doser_control/__init__.py
 """
 Chihiros Doser — Home Assistant service surface (runtime-only).
 
-This module exposes HA services for Chihiros doser devices and now routes
-*all* BLE traffic through the central coordinator created in __init__.py.
-The coordinator owns the long-lived BLE session, keeps the link alive, and
-fans out notifications to subscribers via the HA dispatcher. Older code paths
-that opened ad-hoc connections by resolving MAC addresses have been removed in
-favor of delegating every operation to the coordinator-managed session.
+This module exposes HA services for Chihiros doser devices and is designed to
+cooperate with the *central coordinator* and its optional PinnedBleSession
+(created in __init__.py for doser entries). When available, we reuse that
+persistent BLE connection for writes and to receive push totals via the HA
+dispatcher. If not available, we fall back to short-lived BLE connections
+using Home Assistant’s bluetooth proxy and bleak-retry-connector.
 
 Services registered (subject to build flags):
 - chihiros.dose_ml
@@ -26,6 +25,7 @@ try:
     import asyncio
     import logging
     import time
+    from contextlib import asynccontextmanager
     import voluptuous as vol
 
     from homeassistant.core import HomeAssistant, ServiceCall
@@ -37,7 +37,12 @@ try:
     )
 
     # use HA’s bluetooth helper + bleak-retry-connector (slot-aware, proxy-friendly)
-    from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC
+    from homeassistant.components import bluetooth
+    from bleak_retry_connector import (
+        BleakClientWithServiceCache,
+        BLEAK_RETRY_EXCEPTIONS as BLEAK_EXC,
+        establish_connection,
+    )
 
     from ..const import DOMAIN  # integration domain
     from . import protocol as dp  # protocol helpers (dose_ml, parse_totals_frame, etc.)
@@ -225,25 +230,34 @@ else:
         if not dev:
             return None
 
+        # 1) direct bluetooth connection tuple
         for (conn_type, conn_val) in dev.connections:
             if conn_type == dr.CONNECTION_BLUETOOTH:
                 return conn_val
 
+        # 2) try our DOMAIN identifiers or stored coordinator entries
+        domain_data = hass.data.get(DOMAIN, {})
         for domain, ident in dev.identifiers:
             if domain != DOMAIN:
                 continue
+            # identifier might be an entry_id or "ble:<addr>"
             if isinstance(ident, str) and ident.startswith("ble:"):
                 return ident.split(":", 1)[1]
-            data_by_entry = hass.data.get(DOMAIN, {})
-            data = data_by_entry.get(ident)
-            if data and hasattr(data.coordinator, "address"):
-                return data.coordinator.address
+            data = domain_data.get(ident)
+            if isinstance(data, dict):
+                coord = data.get("coordinator")
+                addr = getattr(coord, "address", None)
+                if isinstance(addr, str) and addr:
+                    return addr
 
+        # 3) check linked config entries
         for entry_id in getattr(dev, "config_entries", set()):
-            data_by_entry = hass.data.get(DOMAIN, {})
-            data = data_by_entry.get(entry_id)
-            if data and hasattr(data.coordinator, "address"):
-                return data.coordinator.address
+            data = domain_data.get(entry_id)
+            if isinstance(data, dict):
+                coord = data.get("coordinator")
+                addr = getattr(coord, "address", None)
+                if isinstance(addr, str) and addr:
+                    return addr
 
         return None
 
@@ -251,33 +265,36 @@ else:
         data_by_entry = hass.data.get(DOMAIN, {})
         addr_l = (addr or "").lower()
         for entry_id, data in data_by_entry.items():
-            coord = getattr(data, "coordinator", None)
+            if not isinstance(data, dict):
+                continue
+            coord = data.get("coordinator")
             c_addr = getattr(coord, "address", None)
             if isinstance(c_addr, str) and c_addr.lower() == addr_l:
                 return entry_id
         return None
 
-    def _get_coordinator_for_address(hass: HomeAssistant, addr: str):
+    def _get_pinned_session_for_address(hass: HomeAssistant, addr: str):
+        """Return PinnedBleSession if present for address; else None."""
         entry_id = _find_entry_id_for_address(hass, addr)
         if not entry_id:
             return None
         data_by_entry = hass.data.get(DOMAIN, {})
         data = data_by_entry.get(entry_id)
-        if not data:
+        if not isinstance(data, dict):
             return None
-        return getattr(data, "coordinator", None)
+        coord = data.get("coordinator")
+        if not coord:
+            return None
+        return getattr(coord, "pinned_session", None)
 
-    async def _run_via_coordinator(coordinator, fn, *, use_gate: bool = False):
-        """Ensure the BLE client is available via the central coordinator."""
-
-        if coordinator is None:
-            raise HomeAssistantError("Coordinator unavailable for device")
-
-        gate = getattr(coordinator, "write_gate", None)
-        if use_gate and isinstance(gate, asyncio.Lock):
+    @asynccontextmanager
+    async def _maybe_gate(session):
+        gate = getattr(session, "write_gate", None)
+        if gate is not None:
             async with gate:
-                return await coordinator.async_with_client(fn)
-        return await coordinator.async_with_client(fn)
+                yield
+        else:
+            yield
 
     # ────────────────────────────────────────────────────────────
     # Probe / prelude helpers
@@ -291,7 +308,7 @@ else:
                 frames.append(dp.encode_5b(0x22, []))
         except Exception:
             pass
-        # conservative extras (A5-encoded) if needed
+        # conservative extras (A5-encoded) if needed; harmless doubles
         try:
             frames.append(dp._encode(dp.CMD_MANUAL_DOSE, 0x1E, []))
         except Exception:
@@ -353,82 +370,184 @@ else:
             channel = int(data["channel"])
             ml = round(float(data["ml"]), 1)
 
-            coordinator = _get_coordinator_for_address(hass, addr_u)
-            if not coordinator:
+            # Try pinned session first (central coordinator path)
+            session = _get_pinned_session_for_address(hass, addr_u)
+            totals_text = "no totals within timeout"
+            if session and getattr(session, "is_connected", False):
+                _LOGGER.info("dose_ml: using pinned session for %s", addr_u)
+
+                # awaitable to capture totals via dispatcher (since session owns notify)
+                loop = asyncio.get_running_loop()
+                got: asyncio.Future[dict] = loop.create_future()
+
+                def _on_push(payload: dict):
+                    if not got.done():
+                        got.set_result(payload)
+
+                unsub = async_dispatcher_connect(
+                    hass, f"{DOMAIN}_push_totals_{addr_l}", _on_push
+                )
+                try:
+                    async with _maybe_gate(session):
+                        await dp.dose_ml(
+                            session.client, channel_1based=channel, ml=ml
+                        )
+                        # send a couple of totals probes; session’s notify will catch the reply
+                        for frame in _build_totals_probes():
+                            try:
+                                try:
+                                    await session.client.write_gatt_char(
+                                        dp.UART_RX, frame, response=True
+                                    )
+                                except Exception:
+                                    await session.client.write_gatt_char(
+                                        dp.UART_TX, frame, response=True
+                                    )
+                            except Exception:
+                                _LOGGER.debug(
+                                    "dose_ml(pinned): probe write failed", exc_info=True
+                                )
+                            await asyncio.sleep(0.1)
+
+                    try:
+                        res = await asyncio.wait_for(got, timeout=8.0)
+                        vals = res.get("ml") or []
+                        totals_text = f"totals={vals}"
+                        _LOGGER.info("dose_ml(pinned): received totals %s", vals)
+                    except asyncio.TimeoutError:
+                        _LOGGER.info(
+                            "dose_ml(pinned): no totals notify received within 8s"
+                        )
+                finally:
+                    try:
+                        unsub()
+                    except Exception:
+                        pass
+
+                if (entry_id := _find_entry_id_for_address(hass, addr_u)):
+                    async_dispatcher_send(
+                        hass, f"{DOMAIN}_{entry_id}_refresh_totals"
+                    )
+
+                elapsed = (time.perf_counter() - started) * 1000
+                await _notify(
+                    hass,
+                    "Chihiros Doser — Dose Now",
+                    f"Address: {addr_u}\nChannel: {channel}\nDose: {ml:.1f} mL\nResult: {totals_text}\nTook: {elapsed:.0f} ms",
+                )
+                return
+
+            # Fallback: short-lived connection (original path)
+            _LOGGER.info(
+                "dose_ml: addr=%s ch=%s ml=%.1f (resolving BLE device)",
+                addr_u,
+                channel,
+                ml,
+            )
+            ble_dev = bluetooth.async_ble_device_from_address(hass, addr_u, True)
+            if not ble_dev:
                 raise HomeAssistantError(
-                    "Chihiros device not loaded — ensure the integration is set up"
+                    f"Could not find BLE device for address {addr_u}"
                 )
 
-            totals_text = "no totals within timeout"
-            loop = asyncio.get_running_loop()
-            got: asyncio.Future[dict] = loop.create_future()
+            got_fut: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
 
-            def _on_push(payload: dict):
-                if not got.done():
-                    got.set_result(payload)
+            def _on_notify(_char, payload: bytearray) -> None:
+                try:
+                    raw = bytes(payload)
+                    _LOGGER.debug(
+                        "dose_ml: notify len=%d head=%s mode=%s raw=%s",
+                        len(raw),
+                        f"{raw[0]:02X}" if raw else "??",
+                        f"{raw[5]:02X}" if len(raw) > 6 else "??",
+                        raw.hex(" ").upper(),
+                    )
+                    vals = dp.parse_totals_frame(raw)
+                    if vals and not got_fut.done():
+                        got_fut.set_result(raw)
+                except Exception:
+                    _LOGGER.exception("dose_ml: notify parse error")
 
-            unsub = async_dispatcher_connect(
-                hass, f"{DOMAIN}_push_totals_{addr_l}", _on_push
-            )
+            client = None
+            try:
+                client = await establish_connection(
+                    BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-dose"
+                )
+                await client.start_notify(UART_TX, _on_notify)
 
-            async def _dose_with_client(client):
-                await dp.dose_ml(client, channel_1based=channel, ml=ml)
+                _LOGGER.info("dose_ml: sending dose…")
+                await dp.dose_ml(client, channel, ml)
+
                 for frame in _build_totals_probes():
                     try:
                         try:
                             await client.write_gatt_char(
                                 dp.UART_RX, frame, response=True
                             )
+                            _LOGGER.debug(
+                                "dose_ml: wrote probe to RX: %s",
+                                frame.hex(" ").upper(),
+                            )
                         except Exception:
                             await client.write_gatt_char(
                                 dp.UART_TX, frame, response=True
                             )
+                            _LOGGER.debug(
+                                "dose_ml: wrote probe to TX: %s",
+                                frame.hex(" ").upper(),
+                            )
                     except Exception:
                         _LOGGER.debug(
-                            "dose_ml(coordinator): probe write failed", exc_info=True
+                            "dose_ml: probe write failed", exc_info=True
                         )
-                    await asyncio.sleep(0.08)
-
-            try:
-                try:
-                    await _run_via_coordinator(
-                        coordinator, _dose_with_client, use_gate=True
-                    )
-                except BLEAK_EXC as e:
-                    _LOGGER.warning("dose_ml: BLE unavailable: %s", e)
-                    raise HomeAssistantError(
-                        f"BLE temporarily unavailable: {e}"
-                    ) from e
-                except Exception as e:
-                    _LOGGER.exception("dose_ml: failed")
-                    raise HomeAssistantError(f"Dose failed: {e}") from e
+                    await asyncio.sleep(0.1)
 
                 try:
-                    res = await asyncio.wait_for(got, timeout=8.0)
-                    vals = res.get("ml") or []
+                    payload = await asyncio.wait_for(got_fut, timeout=8.0)
+                    vals = dp.parse_totals_frame(payload) or []
                     totals_text = f"totals={vals}"
-                    _LOGGER.info("dose_ml(coordinator): received totals %s", vals)
+                    _LOGGER.info("dose_ml: received totals %s", vals)
+                    async_dispatcher_send(
+                        hass,
+                        f"{DOMAIN}_push_totals_{addr_l}",
+                        {"ml": vals, "raw": payload},
+                    )
                 except asyncio.TimeoutError:
                     _LOGGER.info(
-                        "dose_ml(coordinator): no totals notify received within 8s"
+                        "dose_ml: no totals notify received within 8s"
                     )
-            finally:
-                try:
-                    unsub()
-                except Exception:
-                    pass
+                finally:
+                    try:
+                        await client.stop_notify(UART_TX)
+                    except Exception:
+                        pass
 
-            if (entry_id := _find_entry_id_for_address(hass, addr_u)):
-                async_dispatcher_send(
-                    hass, f"{DOMAIN}_{entry_id}_refresh_totals"
+                if (entry_id := _find_entry_id_for_address(hass, addr_u)):
+                    async_dispatcher_send(
+                        hass, f"{DOMAIN}_{entry_id}_refresh_totals"
+                    )
+
+                elapsed = (time.perf_counter() - started) * 1000
+                await _notify(
+                    hass,
+                    "Chihiros Doser — Dose Now",
+                    f"Address: {addr_u}\nChannel: {channel}\nDose: {ml:.1f} mL\nResult: {totals_text}\nTook: {elapsed:.0f} ms",
                 )
 
-            elapsed = (time.perf_counter() - started) * 1000
-            await _notify(
-                hass,
-                "Chihiros Doser — Dose Now",
-                f"Address: {addr_u}\nChannel: {channel}\nDose: {ml:.1f} mL\nResult: {totals_text}\nTook: {elapsed:.0f} ms",
-            )
+            except BLEAK_EXC as e:
+                _LOGGER.warning("dose_ml: BLE unavailable: %s", e)
+                raise HomeAssistantError(
+                    f"BLE temporarily unavailable: {e}"
+                ) from e
+            except Exception as e:
+                _LOGGER.exception("dose_ml: failed")
+                raise HomeAssistantError(f"Dose failed: {e}") from e
+            finally:
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
 
         hass.services.async_register(
             DOMAIN, "dose_ml", _svc_dose, schema=DOSE_SCHEMA
@@ -452,10 +571,60 @@ else:
             channel = int(data["channel"])
             _LOGGER.info("enable_auto_mode: addr=%s ch=%s", addr, channel)
 
-            coordinator = _get_coordinator_for_address(hass, addr.upper())
-            if not coordinator:
+            # Try pinned session (central coordinator path)
+            session = _get_pinned_session_for_address(hass, addr.upper())
+            if session and getattr(session, "is_connected", False):
+                from .dosingcommands import (
+                    create_set_time_command,
+                    create_switch_to_auto_mode_dosing_pump_command,
+                )
+                msg_hi, msg_lo = 0, 0
+                frame_time = create_set_time_command((msg_hi, msg_lo))
+                msg_hi, msg_lo = 0, 1
+                wire_ch = max(1, min(channel, 4)) - 1
+                frame_auto = create_switch_to_auto_mode_dosing_pump_command(
+                    (msg_hi, msg_lo), wire_ch, 0, 1
+                )
+                try:
+                    async with _maybe_gate(session):
+                        await session.client.write_gatt_char(
+                            dp.UART_RX, frame_time, response=True
+                        )
+                        _LOGGER.debug(
+                            "enable_auto_mode(pinned): sent time sync %s",
+                            frame_time.hex(" ").upper(),
+                        )
+                        await session.client.write_gatt_char(
+                            dp.UART_RX, frame_auto, response=True
+                        )
+                        _LOGGER.debug(
+                            "enable_auto_mode(pinned): wrote auto-mode frame to RX"
+                        )
+                except Exception:
+                    # Fallback to TX if RX fails
+                    async with _maybe_gate(session):
+                        await session.client.write_gatt_char(
+                            dp.UART_TX, frame_auto, response=True
+                        )
+                        _LOGGER.debug(
+                            "enable_auto_mode(pinned): RX failed, wrote to TX"
+                        )
+
+                elapsed = (time.perf_counter() - started) * 1000
+                await _notify(
+                    hass,
+                    "Chihiros Doser — Enable Auto",
+                    f"Address: {addr}\nChannel: {channel}\nResult: frame sent (pinned)\nTook: {elapsed:.0f} ms",
+                )
+                return
+
+            # Fallback (short-lived)
+            ble_dev = bluetooth.async_ble_device_from_address(
+                hass, addr.upper(), True
+            )
+            if not ble_dev:
                 raise HomeAssistantError(
-                    "Chihiros device not loaded — ensure the integration is set up"
+                    f"Could not find BLE device for address {addr}"
                 )
 
             from .dosingcommands import (
@@ -463,47 +632,35 @@ else:
                 create_switch_to_auto_mode_dosing_pump_command,
             )
 
-            msg_hi, msg_lo = 0, 0
-            frame_time = create_set_time_command((msg_hi, msg_lo))
-            msg_hi, msg_lo = 0, 1
-            wire_ch = max(1, min(channel, 4)) - 1
-            frame_auto = create_switch_to_auto_mode_dosing_pump_command(
-                (msg_hi, msg_lo), wire_ch, 0, 1
-            )
-
-            def _cb(_char, payload: bytearray):
-                raw = bytes(payload)
-                head = f"{raw[0]:02X}" if raw else "??"
-                mode = f"{raw[5]:02X}" if len(raw) > 6 else "??"
-                _LOGGER.debug(
-                    "enable_auto_mode: notify head=%s mode=%s raw=%s",
-                    head,
-                    mode,
-                    raw.hex(" ").upper(),
+            client = None
+            try:
+                client = await establish_connection(
+                    BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-enable-auto"
                 )
 
-            coordinator.add_notify_callback(_cb)
+                msg_hi, msg_lo = 0, 0
+                frame_time = create_set_time_command((msg_hi, msg_lo))
+                await client.write_gatt_char(dp.UART_RX, frame_time, response=True)
+                _LOGGER.debug(
+                    "enable_auto_mode: sent time sync %s",
+                    frame_time.hex(" ").upper(),
+                )
 
-            async def _send_frames(client):
-                try:
-                    await client.write_gatt_char(
-                        dp.UART_RX, frame_time, response=True
-                    )
-                    _LOGGER.debug(
-                        "enable_auto_mode: sent time sync %s",
-                        frame_time.hex(" ").upper(),
-                    )
-                except Exception:
-                    _LOGGER.debug(
-                        "enable_auto_mode: failed to write time sync to RX", exc_info=True
-                    )
-                    raise
+                msg_hi, msg_lo = 0, 1
+                wire_ch = max(1, min(channel, 4)) - 1
+                frame_auto = create_switch_to_auto_mode_dosing_pump_command(
+                    (msg_hi, msg_lo), wire_ch, 0, 1
+                )
+                _LOGGER.info(
+                    "enable_auto_mode: sending auto-mode frame %s",
+                    frame_auto.hex(" ").upper(),
+                )
 
                 try:
                     await client.write_gatt_char(
                         dp.UART_RX, frame_auto, response=True
                     )
-                    _LOGGER.debug("enable_auto_mode: wrote auto-mode frame to RX")
+                    _LOGGER.debug("enable_auto_mode: wrote to RX")
                 except Exception:
                     await client.write_gatt_char(
                         dp.UART_TX, frame_auto, response=True
@@ -512,31 +669,48 @@ else:
                         "enable_auto_mode: RX failed, wrote to TX instead"
                     )
 
-            try:
-                try:
-                    await _run_via_coordinator(
-                        coordinator, _send_frames, use_gate=True
+                def _cb(_char, payload: bytearray):
+                    raw = bytes(payload)
+                    head = f"{raw[0]:02X}" if raw else "??"
+                    mode = f"{raw[5]:02X}" if len(raw) > 6 else "??"
+                    _LOGGER.debug(
+                        "enable_auto_mode: notify head=%s mode=%s raw=%s",
+                        head,
+                        mode,
+                        raw.hex(" ").upper(),
                     )
-                except BLEAK_EXC as e:
-                    _LOGGER.warning("enable_auto_mode: BLE unavailable: %s", e)
-                    raise HomeAssistantError(
-                        f"BLE temporarily unavailable: {e}"
-                    ) from e
-                except Exception as e:
-                    _LOGGER.exception("enable_auto_mode: failed")
-                    raise HomeAssistantError(f"Enable auto failed: {e}") from e
 
-                _LOGGER.info("enable_auto_mode: listening 3s for ACK/notify…")
+                await client.start_notify(UART_TX, _cb)
+                _LOGGER.info(
+                    "enable_auto_mode: listening 3s for ACK/notify…"
+                )
                 await asyncio.sleep(3.0)
-            finally:
-                coordinator.remove_notify_callback(_cb)
+                await client.stop_notify(UART_TX)
+                _LOGGER.info(
+                    "enable_auto_mode: finished 3s listen window (no blocking ACK wait)"
+                )
 
-            elapsed = (time.perf_counter() - started) * 1000
-            await _notify(
-                hass,
-                "Chihiros Doser — Enable Auto",
-                f"Address: {addr}\nChannel: {channel}\nResult: ACK window complete\nTook: {elapsed:.0f} ms",
-            )
+                elapsed = (time.perf_counter() - started) * 1000
+                await _notify(
+                    hass,
+                    "Chihiros Doser — Enable Auto",
+                    f"Address: {addr}\nChannel: {channel}\nResult: ACK window complete\nTook: {elapsed:.0f} ms",
+                )
+
+            except BLEAK_EXC as e:
+                _LOGGER.warning("enable_auto_mode: BLE unavailable: %s", e)
+                raise HomeAssistantError(
+                    f"BLE temporarily unavailable: {e}"
+                ) from e
+            except Exception as e:
+                _LOGGER.exception("enable_auto_mode: failed")
+                raise HomeAssistantError(f"Enable auto failed: {e}") from e
+            finally:
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
 
         hass.services.async_register(
             DOMAIN, "enable_auto_mode", _svc_enable_auto, schema=ENABLE_AUTO_SCHEMA
@@ -564,42 +738,53 @@ else:
                 ch_id,
             )
 
-            buf: list[str] = []
-            coordinator = _get_coordinator_for_address(hass, addr.upper())
-            if not coordinator:
+            # Keep this as a short-lived listener (does not interfere with pinned session)
+            ble_dev = bluetooth.async_ble_device_from_address(
+                hass, addr.upper(), True
+            )
+            if not ble_dev:
                 raise HomeAssistantError(
-                    "Chihiros device not loaded — ensure the integration is set up"
+                    f"Could not find BLE device for address {addr}"
                 )
 
-            def _cb(_char, payload: bytearray) -> None:
-                try:
-                    b = bytes(payload)
-                    buf.append(
-                        f'["{b[0] if b else 0}", "{b[5] if len(b)>5 else 0}", {list(b[6:-1])}]'
-                    )
-                    if len(buf) <= 3:
-                        _LOGGER.debug(
-                            "read_auto_settings: sample notify %s",
-                            b.hex(" ").upper(),
-                        )
-                except Exception:
-                    pass
-
-            coordinator.add_notify_callback(_cb)
-
-            async def _listen(_client):
-                await asyncio.sleep(max(0.3, timeout_s))
-
+            buf: list[str] = []
+            client = None
             try:
-                try:
-                    await coordinator.async_with_client(_listen)
-                except BLEAK_EXC as e:
-                    _LOGGER.warning("read_auto_settings: BLE unavailable: %s", e)
-                    raise HomeAssistantError(
-                        f"BLE temporarily unavailable: {e}"
-                    ) from e
+                client = await establish_connection(
+                    BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-read-auto"
+                )
+
+                def _cb(_char, payload: bytearray) -> None:
+                    try:
+                        b = bytes(payload)
+                        buf.append(
+                            f'["{b[0] if b else 0}", "{b[5] if len(b)>5 else 0}", {list(b[6:-1])}]'
+                        )
+                        if len(buf) <= 3:
+                            _LOGGER.debug(
+                                "read_auto_settings: sample notify %s",
+                                b.hex(" ").upper(),
+                            )
+                    except Exception:
+                        pass
+
+                await client.start_notify(UART_TX, _cb)
+                await asyncio.sleep(max(0.3, timeout_s))
+            except BLEAK_EXC as e:
+                _LOGGER.warning("read_auto_settings: BLE unavailable: %s", e)
+                raise HomeAssistantError(
+                    f"BLE temporarily unavailable: {e}"
+                ) from e
             finally:
-                coordinator.remove_notify_callback(_cb)
+                if client:
+                    try:
+                        await client.stop_notify(UART_TX)
+                    except Exception:
+                        pass
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
 
             try:
                 recs = dp.parse_log_blob("\n".join(buf))
@@ -640,36 +825,46 @@ else:
                 "read_container_status: addr=%s timeout=%.1fs", addr, timeout_s
             )
 
-            lines: list[str] = []
-            coordinator = _get_coordinator_for_address(hass, addr.upper())
-            if not coordinator:
+            ble_dev = bluetooth.async_ble_device_from_address(
+                hass, addr.upper(), True
+            )
+            if not ble_dev:
                 raise HomeAssistantError(
-                    "Chihiros device not loaded — ensure the integration is set up"
+                    f"Could not find BLE device for address {addr}"
                 )
 
-            def _cb(_char, payload: bytearray) -> None:
-                raw = bytes(payload).hex(" ").upper()
-                lines.append(raw)
-                if len(lines) <= 3:
-                    _LOGGER.debug(
-                        "read_container_status: sample notify %s", raw
-                    )
-
-            coordinator.add_notify_callback(_cb)
-
-            async def _listen(_client):
-                await asyncio.sleep(max(0.3, timeout_s))
-
+            lines: list[str] = []
+            client = None
             try:
-                try:
-                    await coordinator.async_with_client(_listen)
-                except BLEAK_EXC as e:
-                    _LOGGER.warning("read_container_status: BLE unavailable: %s", e)
-                    raise HomeAssistantError(
-                        f"BLE temporarily unavailable: {e}"
-                    ) from e
+                client = await establish_connection(
+                    BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-read-container"
+                )
+
+                def _cb(_char, payload: bytearray) -> None:
+                    raw = bytes(payload).hex(" ").upper()
+                    lines.append(raw)
+                    if len(lines) <= 3:
+                        _LOGGER.debug(
+                            "read_container_status: sample notify %s", raw
+                        )
+
+                await client.start_notify(UART_TX, _cb)
+                await asyncio.sleep(max(0.3, timeout_s))
+            except BLEAK_EXC as e:
+                _LOGGER.warning("read_container_status: BLE unavailable: %s", e)
+                raise HomeAssistantError(
+                    f"BLE temporarily unavailable: {e}"
+                ) from e
             finally:
-                coordinator.remove_notify_callback(_cb)
+                if client:
+                    try:
+                        await client.stop_notify(UART_TX)
+                    except Exception:
+                        pass
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
 
             preview = "\n  ".join(lines[:8])
             msg = (
@@ -712,16 +907,51 @@ else:
                 repeats,
             )
 
-            from .dosingcommands import create_command_encoding_dosing_pump
+            # Use pinned session if available (central coordinator path)
+            session = _get_pinned_session_for_address(hass, addr.upper())
+            if session and getattr(session, "is_connected", False):
+                from .dosingcommands import create_command_encoding_dosing_pump
 
-            coordinator = _get_coordinator_for_address(hass, addr.upper())
-            if not coordinator:
+                sent = 0
+                async with _maybe_gate(session):
+                    msg_hi, msg_lo = 0, 0
+                    for _ in range(repeats):
+                        frame = create_command_encoding_dosing_pump(
+                            cmd_id, mode, (msg_hi, msg_lo), params
+                        )
+                        await session.client.write_gatt_char(
+                            dp.UART_RX, frame, response=True
+                        )
+                        _LOGGER.debug(
+                            "raw_doser_command(pinned): wrote %s",
+                            frame.hex(" ").upper(),
+                        )
+                        sent += 1
+                        msg_lo = (msg_lo + 1) & 0xFF
+                await _notify(
+                    hass,
+                    "Chihiros Doser — Raw command",
+                    f"Address: {addr}\nCMD={cmd_id} MODE={mode}\nParams={params}\nSent: {sent} frame(s) (pinned)",
+                )
+                return
+
+            # Fallback: short-lived
+            ble_dev = bluetooth.async_ble_device_from_address(
+                hass, addr.upper(), True
+            )
+            if not ble_dev:
                 raise HomeAssistantError(
-                    "Chihiros device not loaded — ensure the integration is set up"
+                    f"Could not find BLE device for address {addr}"
                 )
 
-            async def _send_frames(client):
-                sent_local = 0
+            from .dosingcommands import create_command_encoding_dosing_pump
+
+            client = None
+            sent = 0
+            try:
+                client = await establish_connection(
+                    BleakClientWithServiceCache, ble_dev, f"{DOMAIN}-raw-cmd"
+                )
                 msg_hi, msg_lo = 0, 0
                 for _ in range(repeats):
                     frame = create_command_encoding_dosing_pump(
@@ -733,14 +963,8 @@ else:
                     _LOGGER.debug(
                         "raw_doser_command: wrote %s", frame.hex(" ").upper()
                     )
-                    sent_local += 1
+                    sent += 1
                     msg_lo = (msg_lo + 1) & 0xFF
-                return sent_local
-
-            try:
-                sent = await _run_via_coordinator(
-                    coordinator, _send_frames, use_gate=True
-                )
             except BLEAK_EXC as e:
                 _LOGGER.warning("raw_doser_command: BLE unavailable: %s", e)
                 raise HomeAssistantError(
@@ -749,6 +973,12 @@ else:
             except Exception as e:
                 _LOGGER.exception("raw_doser_command: failed")
                 raise HomeAssistantError(f"Raw command failed: {e}") from e
+            finally:
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
 
             await _notify(
                 hass,
