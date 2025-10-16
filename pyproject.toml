@@ -42,3 +42,4 @@ include = [
 
 [project.scripts]
 chihirosctl = "custom_components.chihiros.chihiros_led_control.chihirosctl:app"
+chihiros-bind-key = "custom_components.chihiros.tools.bind_key_cli:app"
