@@ -78,20 +78,31 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         assert self._discovery_info is not None
         addr = (self._discovery_info.address or "").upper()
-        title = getattr(self._discovered_device, "name", None) or self._discovery_info.name or "Chihiros LED"
+        title = (
+            getattr(self._discovered_device, "name", None)
+            or self._discovery_info.name
+            or "Chihiros LED"
+        )
 
         if user_input is not None:
             return self.async_create_entry(title=title, data={CONF_ADDRESS: addr})
 
         self._set_confirm_only()
-        return self.async_show_form(step_id="bluetooth_confirm", description_placeholders={"name": title})
+        return self.async_show_form(
+            step_id="bluetooth_confirm",
+            description_placeholders={"name": title},
+        )
 
     async def async_step_fallback_config(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         assert self._discovery_info is not None
         addr = (self._discovery_info.address or "").upper()
-        default_name = getattr(self._discovered_device, "name", None) or self._discovery_info.name or "Chihiros LED"
+        default_name = (
+            getattr(self._discovered_device, "name", None)
+            or self._discovery_info.name
+            or "Chihiros LED"
+        )
 
         if user_input is not None:
             title = user_input.get(CONF_NAME, default_name)
@@ -109,7 +120,11 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Required("device_type", default="white"): vol.In(["white", "rgb", "wrgb"]),
             }
         )
-        return self.async_show_form(step_id="fallback_config", data_schema=schema, errors={})
+        return self.async_show_form(
+            step_id="fallback_config",
+            data_schema=schema,
+            errors={},
+        )
 
     # ---------- Doser path ----------
     async def async_step_doser_confirm(
@@ -124,7 +139,10 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
             return self.async_create_entry(title=title, data={CONF_ADDRESS: addr})
 
         self._set_confirm_only()
-        return self.async_show_form(step_id="doser_confirm", description_placeholders={"name": title})
+        return self.async_show_form(
+            step_id="doser_confirm",
+            description_placeholders={"name": title},
+        )
 
     # ---------- Manual user-initiated path ----------
     async def async_step_user(
@@ -168,7 +186,11 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
             if model_class in (Fallback, Commander1, Commander4):
                 return await self.async_step_fallback_config()
 
-            title = getattr(self._discovered_device, "name", None) || si.name | | "Chihiros LED"
+            title = (
+                getattr(self._discovered_device, "name", None)
+                or si.name
+                or "Chihiros LED"
+            )
             return self.async_create_entry(title=title, data={CONF_ADDRESS: addr_up})
 
         if not self._discovered_devices:
@@ -177,7 +199,10 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
         schema = vol.Schema(
             {
                 vol.Required(CONF_ADDRESS): vol.In(
-                    {si.address: f"{si.name} ({si.address})" for si in self._discovered_devices.values()}
+                    {
+                        si.address: f"{si.name} ({si.address})"
+                        for si in self._discovered_devices.values()
+                    }
                 )
             }
         )
@@ -186,6 +211,7 @@ class ChihirosConfigFlow(ConfigFlow, domain=DOMAIN):
 
 class ChihirosOptionsFlow(OptionsFlow):
     """Options flow to select which doser channels are enabled."""
+
     def __init__(self, entry: ConfigEntry) -> None:
         self._entry = entry
 
