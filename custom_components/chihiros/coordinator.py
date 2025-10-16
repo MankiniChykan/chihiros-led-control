@@ -16,36 +16,38 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import Any, Callable, Optional
 
+# --- HA imports (guarded so the file can also be imported/tested outside HA) ---
 try:
     from homeassistant.components import bluetooth
     from homeassistant.components.bluetooth.passive_update_coordinator import (
         PassiveBluetoothDataUpdateCoordinator,
     )
     from homeassistant.core import HomeAssistant, callback
-
-    CoordinatorBase: type[PassiveBluetoothDataUpdateCoordinator | _FakeBase]
-    CoordinatorBase = PassiveBluetoothDataUpdateCoordinator  # type: ignore[assignment]
-except ModuleNotFoundError:
-    # Minimal stubs so the file can be imported outside HA (tests, linters, etc.)
-    class _FakeBase:  # pragma: no cover
+    CoordinatorBase = PassiveBluetoothDataUpdateCoordinator  # type: ignore[misc]
+except Exception:  # pragma: no cover
+    # Minimal stubs for non-HA environments (linters, unit tests, CLI)
+    class _FakeBase:  # type: ignore[misc]
         def __init__(self, *a, **kw): ...
-    def callback(fn):  # pragma: no cover
+        def _async_handle_bluetooth_event(self, *a, **kw): ...
+        def _async_handle_unavailable(self, *a, **kw): ...
+    def callback(fn):  # type: ignore[misc]
         return fn
-    class bluetooth:  # pragma: no cover
+    class bluetooth:  # type: ignore[misc]
         class BluetoothScanningMode:
             ACTIVE = "active"
-    class HomeAssistant:  # pragma: no cover
+    class HomeAssistant:  # type: ignore[misc]
         loop: asyncio.AbstractEventLoop
+    CoordinatorBase = _FakeBase  # type: ignore[misc]
 
-    CoordinatorBase = _FakeBase  # type: ignore
+# --- bleak characteristic type (guarded) ---
+try:
+    from bleak.backends.characteristic import BleakGATTCharacteristic  # type: ignore
+except Exception:  # bleak may not be available at import time in HA
+    BleakGATTCharacteristic = Any  # type: ignore
 
 from .chihiros_led_control.device.base_device import BaseDevice
-
-if TYPE_CHECKING:
-    from bleak.backends.device import BLEDevice
-    from bleak.backends.service import BleakGATTCharacteristic
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -59,12 +61,12 @@ class ChihirosDataUpdateCoordinator(CoordinatorBase):  # type: ignore[misc]
     # BaseDevice currently schedules a disconnect ~120s after last activity; we refresh well before that.
     KEEPALIVE_SECONDS: int = 60
 
-    def __init__(self, hass: HomeAssistant, client: BaseDevice, ble_device: BLEDevice) -> None:
+    def __init__(self, hass: HomeAssistant, client: BaseDevice, ble_device: Any) -> None:
         """Initialize the coordinator."""
         self.hass = hass
         self.api: BaseDevice = client
         self.ble_device = ble_device
-        self.address: str = getattr(ble_device, "address", "").upper()
+        self.address: str = (getattr(ble_device, "address", "") or "").upper()
 
         # Data for CoordinatorEntity subclasses (if any want to read something here)
         self.data: dict[str, Any] = {}
@@ -78,7 +80,7 @@ class ChihirosDataUpdateCoordinator(CoordinatorBase):  # type: ignore[misc]
             hass,
             _LOGGER,
             self.address or "chihiros-ble",
-            bluetooth.BluetoothScanningMode.ACTIVE,  # keeps HA radio engaged for this device
+            bluetooth.BluetoothScanningMode.ACTIVE,  # keep HA radio engaged for this device
         )
 
     # ────────────────────────────────────────────────────────────────
@@ -133,9 +135,8 @@ class ChihirosDataUpdateCoordinator(CoordinatorBase):  # type: ignore[misc]
         """Ensure BaseDevice is connected and notifications are active."""
         async with self._connect_lock:
             try:
-                client = await self.api.connect()
-                # BaseDevice.connect() already subscribes to TX notifications in _ensure_connected()
-                # Nothing else to do here unless you want to add extra notify callbacks.
+                _ = await self.api.connect()
+                # BaseDevice.connect() should ensure TX notify is active.
                 _LOGGER.debug("%s: coordinator connected", self.address)
             except Exception as e:
                 _LOGGER.debug("%s: coordinator connect error: %s", self.address, e, exc_info=True)
@@ -145,7 +146,8 @@ class ChihirosDataUpdateCoordinator(CoordinatorBase):  # type: ignore[misc]
     async def async_with_client(self, fn: Callable[[Any], "asyncio.Future[Any] | Any"]) -> Any:
         """Run a coroutine/callable with an ensured connection."""
         await self._ensure_connected()
-        return await fn(self.api.client)  # BaseDevice.client is the Bleak client
+        # BaseDevice.client is the underlying Bleak client
+        return await fn(self.api.client)
 
     # ────────────────────────────────────────────────────────────────
     # Notify callback registration (fan-out owned centrally)
@@ -165,7 +167,7 @@ class ChihirosDataUpdateCoordinator(CoordinatorBase):  # type: ignore[misc]
             _LOGGER.debug("coordinator: remove_notify_callback failed", exc_info=True)
 
     # ────────────────────────────────────────────────────────────────
-    # Bluetooth event hooks (optional but nice for diagnostics)
+    # Bluetooth event hooks (optional but useful for diagnostics)
     # ────────────────────────────────────────────────────────────────
     @callback
     def _async_handle_bluetooth_event(
@@ -176,7 +178,7 @@ class ChihirosDataUpdateCoordinator(CoordinatorBase):  # type: ignore[misc]
         """HA Bluetooth stack says something changed for our device."""
         _LOGGER.debug("%s: BT event: %s", self.address, change)
         super()._async_handle_bluetooth_event(service_info, change)
-        # If you want to trigger a reconnect on certain changes, you could:
+        # If desired, you could trigger a reconnect here:
         # self.hass.loop.create_task(self._ensure_connected())
 
     @callback
@@ -187,4 +189,3 @@ class ChihirosDataUpdateCoordinator(CoordinatorBase):  # type: ignore[misc]
         _LOGGER.debug("%s: device unavailable", self.address)
         super()._async_handle_unavailable(service_info)
         # Keepalive will continue to attempt re-connection in the background.
-
