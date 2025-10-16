@@ -1,4 +1,65 @@
-"""CLI helpers for retrieving Xiaomi MiBeacon bind keys."""
+"""English / Deutsch usage instructions for the bind key CLI.
+
+English:
+    This helper logs in to Xiaomi's Mi Cloud and prints the MiBeacon bind key.
+    1. Install the integration in the same environment as this script.
+    2. Run ``python -m custom_components.chihiros.tools.bind_key_cli fetch``.
+    3. Provide your Mi Account username, password, device DID and region when
+       prompted or via command-line options.
+    4. Copy the reported bind key for use in other tools or Home Assistant.
+
+    ## Retrieving the Xiaomi MiBeacon bind key
+    Xiaomi encrypts the MiBeacon payloads broadcast by Chihiros hardware. To decrypt them you
+    need the per-device bind key that is provisioned when the light or doser is paired with a Mi
+    Account in the Mi Home app. This repository ships a helper CLI that logs into Xiaomi's cloud
+    and requests the key for you.
+
+    1. Pair your device with Mi Home and note the ``did`` shown in the device info page.
+    2. Install the project in a virtual environment as shown above (``pip install -e .``).
+    3. Run the helper and provide your Mi Account credentials when prompted:
+
+       ``chihiros-bind-key fetch --username you@example.com --did <mi-device-id> --region de``
+
+       * Use the two-letter region that matches your Mi Home account (``cn``, ``de``, ``us``,
+         ``sg``, ...). The default is ``de`` (Europe).
+       * Add ``--json`` to print the decrypted Xiaomi response or ``--all`` to list every key
+         returned by the API.
+
+    The command prints a table with the bind key, MAC address, and product identifier. Copy the
+    bind key into your Home Assistant configuration or CLI environment to enable MiBeacon
+    decryption.
+
+Deutsch:
+    Dieses Hilfsprogramm meldet sich bei Xiaomis Mi Cloud an und zeigt den
+    MiBeacon-Bindeschlüssel an.
+    1. Installieren Sie die Integration in derselben Umgebung wie dieses Skript.
+    2. Führen Sie ``python -m custom_components.chihiros.tools.bind_key_cli fetch`` aus.
+    3. Geben Sie bei der Abfrage oder über Befehlszeilenoptionen Ihre
+       Mi-Account-E-Mail, Ihr Passwort, die Geräte-DID und die Region ein.
+    4. Kopieren Sie den ausgegebenen Bindeschlüssel für andere Werkzeuge oder
+       Home Assistant.
+
+    ## Abrufen des Xiaomi-MiBeacon-Bindeschlüssels
+    Xiaomi verschlüsselt die von Chihiros-Geräten ausgesendeten MiBeacon-Nutzdaten. Zur Entschlüsselung
+    benötigen Sie den gerätespezifischen Bindeschlüssel, der beim Koppeln der Lampe oder Dosierpumpe mit
+    einem Mi-Account in der Mi-Home-App bereitgestellt wird. Dieses Repository enthält ein CLI-Hilfsprogramm,
+    das sich bei Xiaomis Cloud anmeldet und den Schlüssel für Sie abruft.
+
+    1. Koppeln Sie Ihr Gerät mit Mi Home und notieren Sie die ``did`` auf der Geräteseite.
+    2. Installieren Sie das Projekt wie oben beschrieben in einer virtuellen Umgebung (``pip install -e .``).
+    3. Führen Sie das Hilfsprogramm aus und geben Sie bei Aufforderung Ihre Mi-Account-Zugangsdaten ein:
+
+       ``chihiros-bind-key fetch --username you@example.com --did <mi-device-id> --region de``
+
+       * Verwenden Sie den zweibuchstabigen Regionscode, der Ihrem Mi-Home-Konto entspricht (``cn``, ``de``,
+         ``us``, ``sg`` ...). Standard ist ``de`` (Europa).
+       * Ergänzen Sie ``--json``, um die entschlüsselte Xiaomi-Antwort auszugeben, oder ``--all``, um alle vom API
+         gelieferten Schlüssel aufzulisten.
+
+    Der Befehl gibt eine Tabelle mit Bindeschlüssel, MAC-Adresse und Produktkennung aus. Kopieren Sie den
+    Bindeschlüssel in Ihre Home-Assistant-Konfiguration oder Ihre CLI-Umgebung, um die MiBeacon-Entschlüsselung
+    zu aktivieren.
+"""
 
 from __future__ import annotations
 
