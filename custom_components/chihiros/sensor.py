@@ -21,8 +21,10 @@ from typing import Any, Optional
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
@@ -147,7 +149,7 @@ class DoserTotalsProxyCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
 
 class ChDoserDailyTotalSensor(
-    CoordinatorEntity[DoserTotalsProxyCoordinator], SensorEntity
+    CoordinatorEntity[DoserTotalsProxyCoordinator], RestoreEntity, SensorEntity
 ):
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_native_unit_of_measurement = "mL"
@@ -159,28 +161,47 @@ class ChDoserDailyTotalSensor(
         super().__init__(coordinator)
         self._ch = ch
         self._attr_name = f"Ch {ch + 1} Daily Dose"
-        self._attr_unique_id = (
-            f"{entry.entry_id}-doser-ch{ch + 1}-daily_total_ml"
-        )
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)}
-        )
+        self._attr_unique_id = f"{entry.entry_id}-doser-ch{ch + 1}-daily_total_ml"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, entry.entry_id)})
+
+    async def async_added_to_hass(self) -> None:
+        """
+        Restore the last known value (from the recorder) if the coordinator
+        doesn’t yet have a value for this channel.
+        """
+        await super().async_added_to_hass()
+
+        # If we already have a pushed value, nothing to restore
+        current_ml = (self.coordinator.data or {}).get("ml") or [None, None, None, None]
+        if self._ch < len(current_ml) and current_ml[self._ch] is not None:
+            return
+
+        last_state = await self.async_get_last_state()
+        if not last_state or last_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            return
+
+        try:
+            restored_val = float(last_state.state)
+        except (TypeError, ValueError):
+            return
+
+        # Seed the coordinator cache for this channel only if it's still empty
+        async with self.coordinator._lock:
+            ml = list((self.coordinator.data or self.coordinator._last).get("ml") or [None, None, None, None])
+            if self._ch < len(ml) and ml[self._ch] is None:
+                ml[self._ch] = restored_val
+                # Keep any existing raw frame (we don't restore that)
+                raw = (self.coordinator.data or self.coordinator._last).get("raw")
+                self.coordinator._last = {"ml": ml[:4], "raw": raw}
+                # Publish the seeded value so the sensor shows immediately
+                self.coordinator.async_set_updated_data(self.coordinator._last)
 
     @property
     def native_value(self) -> Optional[float]:
-        ml = (self.coordinator.data or {}).get("ml") or [
-            None,
-            None,
-            None,
-            None,
-        ]
+        ml = (self.coordinator.data or {}).get("ml") or [None, None, None, None]
         return ml[self._ch] if self._ch < len(ml) else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         raw = (self.coordinator.data or {}).get("raw")
-        return {
-            "raw_frame": raw.hex(" ").upper()
-            if isinstance(raw, (bytes, bytearray))
-            else None
-        }
+        return {"raw_frame": raw.hex(" ").upper() if isinstance(raw, (bytes, bytearray)) else None}
